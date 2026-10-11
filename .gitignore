@@ -1,0 +1,10 @@
+# Runtime state: never commit. Back up the database and the
+# identity file together — the swarm allowlist pins the key.
+*.db
+*.db-wal
+*.db-shm
+warmer
+warmer.exe
+.env
+warmer-identity.json
+*.log
