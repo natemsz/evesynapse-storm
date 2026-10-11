@@ -137,6 +137,7 @@ func (p *poller) tick(ctx context.Context, now time.Time) time.Duration {
 	if hold := p.esi.budgetHold(now); hold > 0 {
 		return hold
 	}
+	p.heartbeatDue(ctx, now)
 	for _, region := range hubRegions {
 		if hold, done := p.pollOrders(ctx, region.id, now); done {
 			return hold
@@ -148,7 +149,6 @@ func (p *poller) tick(ctx context.Context, now time.Time) time.Duration {
 	if hold, done := p.pollNames(ctx); done {
 		return hold
 	}
-	p.heartbeatDue(ctx, now)
 	return 0
 }
 
