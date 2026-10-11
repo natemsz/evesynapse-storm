@@ -1,4 +1,4 @@
-# EveSynapse swarm warmer
+# EveSynapseStorm Swarm Cache Worker
 
 A standalone node that mirrors public ESI data and serves it to the
 EveSynapse swarm. Same wire protocol as the main instance
@@ -98,6 +98,10 @@ Standard library, plus one: `modernc.org/sqlite` (pure Go, no
 cgo toolchain needed) — the SQLite requirement forces a driver,
 and the pure-Go one keeps the build a single static binary.
 Routing is the standard `ServeMux`; no router dependency.
+
+## Install
+
+Grab the latest release for your architecture (arm64 and amd64 available) or compile from source. Move the .tar.gz to your box, unpack, and run setup.sh. After that, follow the instructions to set up your .env properly and start the service.
 
 ## Development
 
