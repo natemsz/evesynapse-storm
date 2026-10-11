@@ -14,11 +14,13 @@ jobs:
           go-version: '1.27'
       - run: GOOS=linux GOARCH=amd64 go build -trimpath -o storm-amd64 .
       - run: GOOS=linux GOARCH=arm64 go build -trimpath -o storm-arm64 .
+      - run: tar -czf storm-linux-amd64.tar.gz storm-amd64 setup.sh
+      - run: tar -czf storm-linux-arm64.tar.gz storm-arm64 setup.sh
       - uses: actions/upload-artifact@v4
         with:
           name: storm-linux-amd64
-          path: storm-amd64
+          path: storm-linux-amd64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: storm-linux-arm64
-          path: storm-arm64
+          path: storm-linux-arm64.tar.gz
