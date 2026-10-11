@@ -26,6 +26,7 @@ package main
 // ---------------------------------------------------------------------------
 
 import (
+	"log"
 	"context"
 	"encoding/json"
 	"errors"
@@ -369,6 +370,7 @@ func (p *poller) fetchNames(ctx context.Context, ids []int64, now time.Time) (ti
 // error: discovery retries next pass.
 func (p *poller) heartbeatDue(ctx context.Context, now time.Time) {
 	if p.cfg.seedURL == "" || p.cfg.publicBaseURL == "" {
+		log.Printf("warmer: heartbeat skipped: seedURL=%q publicBaseURL=%q", p.cfg.seedURL, p.cfg.publicBaseURL)
 		return
 	}
 	if raw, err := p.store.getMeta("last_heartbeat"); err == nil && raw != "" {
@@ -378,11 +380,14 @@ func (p *poller) heartbeatDue(ctx context.Context, now time.Time) {
 	}
 	entry, err := signSwarmEntry(p.id, p.id.id, swarmAnnounceKind, p.id.id, announcePayload(p.cfg.publicBaseURL, p.id.publicString()), now)
 	if err != nil {
+		log.Printf("warmer: heartbeat sign failed: %v", err)
 		return
 	}
 	if err := sendSeedAnnounce(ctx, p.cfg.secret, p.cfg.seedURL, entry); err != nil {
+		log.Printf("warmer: heartbeat send failed: %v", err)
 		return
 	}
+	log.Printf("warmer: heartbeat sent to %s", p.cfg.seedURL)
 	_ = p.store.putMeta("last_heartbeat", now.UTC().Format(time.RFC3339))
 }
 
