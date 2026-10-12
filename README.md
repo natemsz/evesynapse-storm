@@ -8,9 +8,11 @@ member list, the pull endpoint, auth, and size caps match
 byte-for-byte, or the main instance rejects every entry.
 
 The main instance **pulls** from this node through the existing
-swarm protocol. This node never pushes anywhere except its seed
-heartbeat. It holds no credentials: no SSO, no client secret, no
-token key, no character or corporation logic.
+swarm protocol. This node is a source, never a puller: it holds no
+peer list, dials no peer, stages no entries, and serves only what
+its own ESI polling warmed. Its sole outbound call besides ESI is
+the seed heartbeat. It holds no credentials: no SSO, no client
+secret, no token key, no character or corporation logic.
 
 ## What it warms
 
@@ -74,6 +76,12 @@ address.
   never null. Unknown kinds and unheld keys are skipped
   silently. Entries are signed at serve time over the row's own
   fetch time.
+- `POST /swarm/seed/register` files one heartbeat, mirroring the
+  Cloudflare seed worker (same shapes, same status codes): a
+  self-signed `announce` entry whose payload names an `https`
+  address and a public key. Listings live 48 hours, a thousand
+  store, five hundred serve — after that this node doubles as
+  the directory instances discover each other through.
 - Every entry envelope is `{v:1, kind, key, payload, fetched_at,
   signer}` as canonical `encoding/json` (struct order, HTML
   escaping); the signature is standard Ed25519, base64.

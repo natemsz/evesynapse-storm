@@ -81,7 +81,23 @@ CREATE TABLE IF NOT EXISTS org_records(
 	expires_at INTEGER NOT NULL,
 	PRIMARY KEY(kind, id)
 );
+CREATE TABLE IF NOT EXISTS seed_peers(
+	instance_id    TEXT PRIMARY KEY,
+	base_url       TEXT NOT NULL,
+	public_key     TEXT NOT NULL,
+	last_heartbeat INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_seed_peers_heartbeat ON seed_peers(last_heartbeat);
 `
+
+// Seed directory bounds, mirroring the Cloudflare seed worker:
+// heartbeats live 48 hours, a thousand records store, five
+// hundred serve.
+const (
+	seedPeerTTL        = 48 * time.Hour
+	maxStoredSeedPeers = 1000
+	maxServedSeedPeers = 500
+)
 
 // store is the SQLite handle.
 type store struct {
@@ -407,4 +423,74 @@ func (s *store) getOrgRecord(kind string, id int64) (payload string, fetchedAt, 
 		return "", time.Time{}, time.Time{}, false, fmt.Errorf("warmer: read org record: %w", err)
 	}
 	return payload, time.Unix(fetchedUnix, 0).UTC(), time.Unix(expiresUnix, 0).UTC(), true, nil
+}
+
+// seedPeer is one heartbeat the directory holds.
+type seedPeer struct {
+	instanceID    string
+	baseURL       string
+	publicKey     string
+	lastHeartbeat time.Time
+}
+
+// upsertSeedPeer files one heartbeat: a re-announce refreshes
+// the address, the key, and the 48-hour listing.
+func (s *store) upsertSeedPeer(instanceID, baseURL, publicKey string, now time.Time) error {
+	if _, err := s.db.Exec(`INSERT INTO seed_peers(instance_id, base_url, public_key, last_heartbeat) VALUES(?, ?, ?, ?)
+		ON CONFLICT(instance_id) DO UPDATE SET base_url = excluded.base_url, public_key = excluded.public_key, last_heartbeat = excluded.last_heartbeat`,
+		instanceID, baseURL, publicKey, now.UTC().Unix()); err != nil {
+		return fmt.Errorf("warmer: file heartbeat: %w", err)
+	}
+	return nil
+}
+
+// countSeedPeers reports the directory size.
+func (s *store) countSeedPeers() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM seed_peers`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("warmer: count directory: %w", err)
+	}
+	return n, nil
+}
+
+// hasSeedPeer reports whether one ID is already listed.
+func (s *store) hasSeedPeer(instanceID string) (bool, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM seed_peers WHERE instance_id = ?`, instanceID).Scan(&n); err != nil {
+		return false, fmt.Errorf("warmer: check directory: %w", err)
+	}
+	return n > 0, nil
+}
+
+// listSeedPeers reads the fresh listings, freshest heartbeat
+// first, bounded — the worker's order and cap.
+func (s *store) listSeedPeers(now time.Time, limit int) ([]seedPeer, error) {
+	rows, err := s.db.Query(`SELECT instance_id, base_url, public_key, last_heartbeat FROM seed_peers
+		WHERE last_heartbeat > ? ORDER BY last_heartbeat DESC LIMIT ?`, now.Add(-seedPeerTTL).UTC().Unix(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("warmer: read directory: %w", err)
+	}
+	defer rows.Close()
+	var out []seedPeer
+	for rows.Next() {
+		var p seedPeer
+		var unix int64
+		if err := rows.Scan(&p.instanceID, &p.baseURL, &p.publicKey, &unix); err != nil {
+			return nil, fmt.Errorf("warmer: read directory: %w", err)
+		}
+		p.lastHeartbeat = time.Unix(unix, 0).UTC()
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("warmer: read directory: %w", err)
+	}
+	return out, nil
+}
+
+// pruneSeedPeers drops listings whose heartbeat lapsed.
+func (s *store) pruneSeedPeers(now time.Time) error {
+	if _, err := s.db.Exec(`DELETE FROM seed_peers WHERE last_heartbeat <= ?`, now.Add(-seedPeerTTL).UTC().Unix()); err != nil {
+		return fmt.Errorf("warmer: prune directory: %w", err)
+	}
+	return nil
 }

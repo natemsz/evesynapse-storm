@@ -344,3 +344,60 @@ func TestServeKindMatrix(t *testing.T) {
 		t.Error("malformed key served")
 	}
 }
+
+// TestWarmerContactsOnlyESIAndSeed proves the node is a source,
+// never a puller: one full tick plus serving held keys contacts
+// exactly two endpoints — ESI for polling, and the seed's
+// register route for the heartbeat. No peer is ever dialed,
+// because no peer address ever enters the node.
+func TestWarmerContactsOnlyESIAndSeed(t *testing.T) {
+	esiSrv, f := newFakeESI(t)
+	var seedMu sync.Mutex
+	var seedHits []string
+	seedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seedMu.Lock()
+		seedHits = append(seedHits, r.Method+" "+r.URL.Path)
+		seedMu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(seedSrv.Close)
+	st, err := openStore(t.TempDir() + "/warm.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.close() })
+	id, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{
+		secret: testSecret, pollInterval: time.Minute,
+		seedURL: seedSrv.URL, publicBaseURL: "https://warmer.example.com",
+	}
+	p := newPoller(cfg, newESIClientWithBase(esiSrv.URL, "test@example.com"), st, id)
+	if hold := p.tick(context.Background(), time.Now().UTC()); hold != 0 {
+		t.Fatalf("tick held %s", hold)
+	}
+	if n := f.total.Load(); n == 0 {
+		t.Fatal("tick polled nothing")
+	}
+	// Serving held keys spends no call anywhere.
+	before := f.total.Load()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, _, ok := p.serveKey(ctx, swarmKindHistory, "10000002/34", now); !ok {
+		t.Error("warmed history does not serve")
+	}
+	if _, _, ok := p.serveKey(ctx, swarmKindTypeName, "34", now); !ok {
+		t.Error("warmed type name does not serve")
+	}
+	if after := f.total.Load(); after != before {
+		t.Errorf("serving held keys spent %d outbound calls", after-before)
+	}
+	seedMu.Lock()
+	hits := append([]string(nil), seedHits...)
+	seedMu.Unlock()
+	if len(hits) != 1 || hits[0] != "POST /swarm/seed/register" {
+		t.Errorf("seed contacts %v, want exactly one heartbeat", hits)
+	}
+}
