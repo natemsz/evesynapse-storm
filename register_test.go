@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -22,7 +23,7 @@ import (
 func announceHeartbeat(t *testing.T, id *swarmIdentity, baseURL string) swarmSignedEntry {
 	t.Helper()
 	entry, err := signSwarmEntry(id, id.id, swarmAnnounceKind, id.id,
-		announcePayload(baseURL, id.publicString()), time.Now())
+		announcePayload(id, baseURL), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +140,7 @@ func TestSeedRegisterCodes(t *testing.T) {
 	big := strings.Repeat("x", maxSwarmBodyBytes+1)
 	// Signed by another key while claiming goodID's: proof fails.
 	resigned, err := signSwarmEntry(otherID, goodID.id, swarmAnnounceKind, goodID.id,
-		announcePayload("https://node.example", goodID.publicString()), time.Now())
+		announcePayload(goodID, "https://node.example"), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +179,7 @@ func TestSeedRegisterCodes(t *testing.T) {
 		"http address":  `{"base_url":"http://node.example","public_key":"k"}`,
 		"loopback":      `{"base_url":"http://127.0.0.1:8079","public_key":"k"}`,
 		"missing key":   `{"base_url":"https://node.example"}`,
-		"foreign proof": announcePayload("https://node.example", otherID.publicString()),
+		"foreign proof": announcePayload(otherID, "https://node.example"),
 	}
 	for name, payload := range payloadCases {
 		entry, err := signSwarmEntry(goodID, goodID.id, swarmAnnounceKind, goodID.id, payload, time.Now())
@@ -209,7 +210,7 @@ func TestSeedDirectoryExpiry(t *testing.T) {
 		t.Fatalf("register fresh: status %d", rec.Code)
 	}
 	store := srv.poller.store
-	if err := store.upsertSeedPeer("stale-id", "https://stale.example", strings.Repeat("A", 44), time.Now().UTC()); err != nil {
+	if err := store.upsertSeedPeer("stale-id", "https://stale.example", strings.Repeat("A", 44), "", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.db.Exec(`UPDATE seed_peers SET last_heartbeat = ? WHERE instance_id = 'stale-id'`,
@@ -250,7 +251,7 @@ func TestSeedDirectoryCapacity(t *testing.T) {
 	store := srv.poller.store
 	now := time.Now().UTC()
 	for i := 0; i < maxStoredSeedPeers-1; i++ {
-		if err := store.upsertSeedPeer(fmt.Sprintf("filler-%d", i), "https://filler.example", strings.Repeat("A", 44), now); err != nil {
+		if err := store.upsertSeedPeer(fmt.Sprintf("filler-%d", i), "https://filler.example", strings.Repeat("A", 44), "", now); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -270,5 +271,107 @@ func TestSeedDirectoryCapacity(t *testing.T) {
 	}
 	if rec := postEntry(srv, announceHeartbeat(t, listed, "https://listed.example")); rec.Code != http.StatusOK {
 		t.Fatalf("re-announce listed: status %d, want 200", rec.Code)
+	}
+}
+
+// TestMemberMessageVector pins the bytes a member signs to own
+// its address and one signature over them from a fixed key: the
+// same vector the main instance pins. If it changes, every
+// instance, warmer and seed must change with it.
+func TestMemberMessageVector(t *testing.T) {
+	if got := string(swarmMemberMessage("id-1", "https://node.example.org")); got != "member\nid-1\nhttps://node.example.org" {
+		t.Fatalf("member message %q", got)
+	}
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
+	id := &swarmIdentity{id: "id-1", public: priv.Public().(ed25519.PublicKey), private: priv}
+	const wantSig = "hL4z+hW20TvMySFe3JJSpEqfUihMK56p+tGu8J9qs+ZLn14WrlNvaYpIBVxxrBjC5ZI4LVOimPXGL83Vr7LWBA=="
+	if got := signSwarmMember(id, "https://node.example.org"); got != wantSig {
+		t.Fatalf("url_sig %s, want %s", got, wantSig)
+	}
+}
+
+// TestMembersCarryOwnersSignatures: the node signs its own tuple
+// and relays a registered peer's tuple exactly as it arrived.
+func TestMembersCarryOwnersSignatures(t *testing.T) {
+	srv, id := testRig(t)
+	peer, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := postEntry(srv, announceHeartbeat(t, peer, "https://peer.example")); rec.Code != http.StatusOK {
+		t.Fatalf("register: status %d", rec.Code)
+	}
+	byID := map[string]swarmMember{}
+	for _, m := range readMembers(t, srv, id) {
+		byID[m.InstanceID] = m
+	}
+	self, ok := byID[id.id]
+	if !ok || !verifySwarmMember(self) {
+		t.Fatalf("own tuple %+v carries no valid address signature", self)
+	}
+	relayed, ok := byID[peer.id]
+	if !ok || relayed.BaseURL != "https://peer.example" || relayed.URLSig != signSwarmMember(peer, "https://peer.example") || !verifySwarmMember(relayed) {
+		t.Fatalf("relayed tuple %+v was not passed on as registered", relayed)
+	}
+}
+
+// TestSeedRegisterNeedsAddressSignature: a heartbeat whose
+// payload lacks the sender's signature over its address, or
+// carries one made for another address, is refused.
+func TestSeedRegisterNeedsAddressSignature(t *testing.T) {
+	srv, _ := testRig(t)
+	peer, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, sig := range map[string]string{
+		"no signature":             "",
+		"signed for another place": signSwarmMember(peer, "https://elsewhere.example"),
+	} {
+		raw, err := json.Marshal(seedAnnouncePayload{BaseURL: "https://peer.example", PublicKey: peer.publicString(), URLSig: sig})
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, err := signSwarmEntry(peer, peer.id, swarmAnnounceKind, peer.id, string(raw), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec := postEntry(srv, entry); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status %d, want 400", name, rec.Code)
+		}
+	}
+}
+
+// TestSeedRegisterKeepsFirstKey: while an ID is listed, a
+// heartbeat for it under another key is a conflict and changes
+// nothing; the owner can still move its own address.
+func TestSeedRegisterKeepsFirstKey(t *testing.T) {
+	srv, id := testRig(t)
+	peer, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := postEntry(srv, announceHeartbeat(t, peer, "https://peer.example")); rec.Code != http.StatusOK {
+		t.Fatalf("register: status %d", rec.Code)
+	}
+	impostor, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	impostor.id = peer.id
+	if rec := postEntry(srv, announceHeartbeat(t, impostor, "https://impostor.example")); rec.Code != http.StatusConflict {
+		t.Fatalf("impostor heartbeat: status %d, want 409", rec.Code)
+	}
+	if rec := postEntry(srv, announceHeartbeat(t, peer, "https://moved.example")); rec.Code != http.StatusOK {
+		t.Fatalf("owner re-announce: status %d", rec.Code)
+	}
+	for _, m := range readMembers(t, srv, id) {
+		if m.InstanceID == peer.id && (m.PublicKey != peer.publicString() || m.BaseURL != "https://moved.example") {
+			t.Fatalf("listing after the conflict: %+v", m)
+		}
 	}
 }

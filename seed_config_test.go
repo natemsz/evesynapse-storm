@@ -59,7 +59,7 @@ func TestSeedAnnounceRoundTrip(t *testing.T) {
 	}))
 	defer srv.Close()
 	entry, err := signSwarmEntry(id, id.id, swarmAnnounceKind, id.id,
-		announcePayload("https://warmer.example.com", id.publicString()), time.Now())
+		announcePayload(id, "https://warmer.example.com"), time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

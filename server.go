@@ -79,13 +79,16 @@ func (s *server) handleMembers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
+	// This node signs its own tuple and nobody else's: every
+	// listed peer's tuple goes out exactly as it registered.
 	members := []swarmMember{{
 		InstanceID: s.id.id, BaseURL: s.cfg.publicBaseURL,
 		PublicKey: s.id.publicString(),
+		URLSig:    signSwarmMember(s.id, s.cfg.publicBaseURL),
 	}}
 	for _, p := range peers {
 		members = append(members, swarmMember{
-			InstanceID: p.instanceID, BaseURL: p.baseURL, PublicKey: p.publicKey,
+			InstanceID: p.instanceID, BaseURL: p.baseURL, PublicKey: p.publicKey, URLSig: p.urlSig,
 		})
 	}
 	raw, err := json.Marshal(members)
@@ -151,8 +154,10 @@ func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
 // 403, an unreadable or misshapen announce is 400, and a full
 // directory answers 429. The signature verifies against the
 // CLAIMED key — self-signed, the same trust-on-first-use as mesh
-// gossip — and the address must be https, like the worker
-// demands.
+// gossip — the address must be https, like the worker demands,
+// and the payload must carry the sender's signature over that
+// address (url_sig). A heartbeat for a listed ID under another
+// key is 409.
 func (s *server) handleSeedRegister(w http.ResponseWriter, r *http.Request) {
 	if _, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); !ok {
 		http.NotFound(w, r)
@@ -204,12 +209,25 @@ func (s *server) handleSeedRegister(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	// The member tuple itself: the sender's signature over its
+	// ID and address, under the same key. It is what gets stored
+	// and relayed, so it is checked before it is kept.
+	if !verifySwarmMember(swarmMember{InstanceID: entry.Signer, BaseURL: detail.BaseURL, PublicKey: detail.PublicKey, URLSig: detail.URLSig}) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 	now := time.Now().UTC()
 	store := s.poller.store
 	_ = store.pruneSeedPeers(now)
-	listed, err := store.hasSeedPeer(entry.Signer)
+	heldKey, listed, err := store.seedPeerKey(entry.Signer)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
+		return
+	}
+	// First key wins for an instance ID while its listing lives:
+	// a heartbeat under another key is a conflict, not a rotation.
+	if listed && heldKey != detail.PublicKey {
+		http.Error(w, "conflict", http.StatusConflict)
 		return
 	}
 	if !listed {
@@ -223,7 +241,7 @@ func (s *server) handleSeedRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := store.upsertSeedPeer(entry.Signer, detail.BaseURL, detail.PublicKey, now); err != nil {
+	if err := store.upsertSeedPeer(entry.Signer, detail.BaseURL, detail.PublicKey, detail.URLSig, now); err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}

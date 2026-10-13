@@ -115,6 +115,36 @@ type swarmMember struct {
 	InstanceID string `json:"instance_id"`
 	BaseURL    string `json:"base_url"`
 	PublicKey  string `json:"public_key"`
+	// URLSig is the member's own signature over its ID and
+	// address (swarmMemberMessage), made with the key beside it.
+	// A tuple is relayed exactly as its owner issued it.
+	URLSig string `json:"url_sig"`
+}
+
+// swarmMemberMessage is what a member signs to own its address:
+// "member\n" + instance ID + "\n" + base URL. Byte-for-byte the
+// main instance's function of the same name.
+func swarmMemberMessage(instanceID, baseURL string) []byte {
+	return []byte("member\n" + instanceID + "\n" + baseURL)
+}
+
+// signSwarmMember signs this node's own address.
+func signSwarmMember(id *swarmIdentity, baseURL string) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(id.private, swarmMemberMessage(id.id, baseURL)))
+}
+
+// verifySwarmMember checks a tuple's address signature against
+// the public key in the same tuple.
+func verifySwarmMember(m swarmMember) bool {
+	pub, err := base64.StdEncoding.DecodeString(m.PublicKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(m.URLSig)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(pub, swarmMemberMessage(m.InstanceID, m.BaseURL), sig)
 }
 
 // swarmPullRequest is one pull: the keys the caller wants.
@@ -129,10 +159,13 @@ type swarmPullKey struct {
 }
 
 // seedAnnouncePayload is what a seed heartbeat seals: where to
-// dial, and the key the signature already proved.
+// dial, the key the signature already proved, and the sender's
+// own signature over its address. Together they are the member
+// tuple the receiver stores and relays verbatim.
 type seedAnnouncePayload struct {
 	BaseURL   string `json:"base_url"`
 	PublicKey string `json:"public_key"`
+	URLSig    string `json:"url_sig"`
 }
 
 // The payload schemas, copied from the main instance's
