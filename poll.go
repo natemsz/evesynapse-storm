@@ -15,7 +15,9 @@ package main
 //   - corporation/alliance records on demand: no public endpoint
 //     enumerates the ones the swarm wants, so the first pull for
 //     an unheld record fetches it (single-flighted), then it is
-//     served from SQLite until its Expires lapses.
+//     served from SQLite until its Expires lapses;
+//   - swarm demand first of all: covered keys peers pulled and
+//     this node missed (warm.go), so the next pull serves them.
 //
 // Structure names are never fetched: that endpoint needs a
 // token, and this node holds none by design.
@@ -98,10 +100,13 @@ type esiHistoryDay struct {
 	OrderCount int64   `json:"order_count"`
 }
 
-// esiName is one answer of POST /universe/names/.
+// esiName is one answer of POST /universe/names/. The endpoint
+// resolves any EVE ID, so only an inventory_type answer is a
+// type name.
 type esiName struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	Category string `json:"category"`
 }
 
 // poller fetches ESI into the store and serves swarm keys.
@@ -123,6 +128,7 @@ type flight struct {
 	fetchedAt time.Time
 	expiresAt time.Time
 	ok        bool
+	hold      time.Duration
 }
 
 // newPoller builds the poll loop.
@@ -139,6 +145,9 @@ func (p *poller) tick(ctx context.Context, now time.Time) time.Duration {
 		return hold
 	}
 	p.heartbeatDue(ctx, now)
+	if hold, done := p.pollDemand(ctx, now); done {
+		return hold
+	}
 	for _, region := range hubRegions {
 		if hold, done := p.pollOrders(ctx, region.id, now); done {
 			return hold
@@ -355,7 +364,7 @@ func (p *poller) fetchNames(ctx context.Context, ids []int64, now time.Time) (ti
 		return 0, false
 	}
 	for _, n := range names {
-		if n.ID <= 0 || n.Name == "" || len(n.Name) > 256 {
+		if n.ID <= 0 || n.Name == "" || len(n.Name) > 256 || n.Category != "inventory_type" {
 			continue
 		}
 		if err := p.store.upsertTypeName(n.ID, n.Name, now); err != nil {
@@ -423,15 +432,7 @@ func (p *poller) serveKey(ctx context.Context, kind, key string, now time.Time) 
 // serveHistory serves one region/type pair's day rows, newest
 // first, bounded — the wire shape the main instance stages.
 func (p *poller) serveHistory(key string, now time.Time) (string, time.Time, bool) {
-	parts := strings.Split(key, "/")
-	if len(parts) != 2 {
-		return "", time.Time{}, false
-	}
-	regionID, ok := parseSwarmID(parts[0])
-	if !ok {
-		return "", time.Time{}, false
-	}
-	typeID, ok := parseSwarmID(parts[1])
+	regionID, typeID, ok := parseHistoryKey(key)
 	if !ok {
 		return "", time.Time{}, false
 	}
@@ -455,6 +456,21 @@ func (p *poller) serveHistory(key string, now time.Time) (string, time.Time, boo
 		return "", time.Time{}, false
 	}
 	return string(raw), last, true
+}
+
+// parseHistoryKey reads a "region/type" history key.
+func parseHistoryKey(key string) (regionID, typeID int64, ok bool) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	if regionID, ok = parseSwarmID(parts[0]); !ok {
+		return 0, 0, false
+	}
+	if typeID, ok = parseSwarmID(parts[1]); !ok {
+		return 0, 0, false
+	}
+	return regionID, typeID, true
 }
 
 // serveTypeName serves one held type name. Names carry no stored
@@ -499,7 +515,7 @@ func (p *poller) serveOrg(ctx context.Context, kind, key string, now time.Time) 
 		}
 		return string(raw), fetched, true
 	}
-	payload, fetched, ok := p.fetchOrg(ctx, wireKind, endpoint, id, now)
+	payload, fetched, ok, _ := p.fetchOrg(ctx, wireKind, endpoint, id, now)
 	if !ok {
 		return "", time.Time{}, false
 	}
@@ -511,57 +527,61 @@ func (p *poller) serveOrg(ctx context.Context, kind, key string, now time.Time) 
 }
 
 // fetchOrg fetches one record live, joining an in-progress fetch
-// for the same record instead of doubling the ESI call.
-func (p *poller) fetchOrg(ctx context.Context, wireKind, endpoint string, id int64, now time.Time) (string, time.Time, bool) {
+// for the same record instead of doubling the ESI call. hold is
+// nonzero when ESI signaled a limit — a pull ignores it, the
+// poll loop ends its pass on it.
+func (p *poller) fetchOrg(ctx context.Context, wireKind, endpoint string, id int64, now time.Time) (payload string, fetchedAt time.Time, ok bool, hold time.Duration) {
 	flightKey := wireKind + "/" + itoa(id)
 	p.flightsMu.Lock()
 	if f, dupe := p.flights[flightKey]; dupe {
 		p.flightsMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return "", time.Time{}, false
+			return "", time.Time{}, false, 0
 		case <-f.done:
-			return f.payload, f.fetchedAt, f.ok
+			return f.payload, f.fetchedAt, f.ok, f.hold
 		}
 	}
 	f := &flight{done: make(chan struct{})}
 	p.flights[flightKey] = f
 	p.flightsMu.Unlock()
-	f.payload, f.fetchedAt, f.expiresAt, f.ok = p.loadOrg(ctx, wireKind, endpoint, id, now)
+	f.payload, f.fetchedAt, f.expiresAt, f.ok, f.hold = p.loadOrg(ctx, wireKind, endpoint, id, now)
 	close(f.done)
 	p.flightsMu.Lock()
 	delete(p.flights, flightKey)
 	p.flightsMu.Unlock()
-	return f.payload, f.fetchedAt, f.ok
+	return f.payload, f.fetchedAt, f.ok, f.hold
 }
 
 // loadOrg performs one record fetch: a fresh negative marker or
 // a live record suppresses the call; a 404 records the negative
-// marker; the stored payload is ESI's body verbatim.
-func (p *poller) loadOrg(ctx context.Context, wireKind, endpoint string, id int64, now time.Time) (string, time.Time, time.Time, bool) {
+// marker; the stored payload is ESI's body verbatim. hold is
+// ESI's stop signal, when it sent one.
+func (p *poller) loadOrg(ctx context.Context, wireKind, endpoint string, id int64, now time.Time) (string, time.Time, time.Time, bool, time.Duration) {
 	negKey := "neg:" + wireKind + "/" + itoa(id)
 	if fresh, err := p.store.cacheFresh(negKey, now); err == nil && fresh {
-		return "", time.Time{}, time.Time{}, false
+		return "", time.Time{}, time.Time{}, false, 0
 	}
 	body, expires, err := p.esi.get(ctx, fmt.Sprintf("/%s/%d/", endpoint, id))
 	if err != nil {
 		if isNotFound(err) {
 			_ = p.store.noteCache(negKey, now.Add(orgNegativeTTL))
 		}
-		return "", time.Time{}, time.Time{}, false
+		hold, _ := limited(err)
+		return "", time.Time{}, time.Time{}, false, hold
 	}
 	payload := string(body)
 	var probe any
 	if err := json.Unmarshal(body, &probe); err != nil {
-		return "", time.Time{}, time.Time{}, false
+		return "", time.Time{}, time.Time{}, false, 0
 	}
 	if len(payload) > maxSwarmPayloadBytes {
-		return "", time.Time{}, time.Time{}, false
+		return "", time.Time{}, time.Time{}, false, 0
 	}
 	if err := p.store.upsertOrgRecord(wireKind, id, payload, now, expires); err != nil {
-		return "", time.Time{}, time.Time{}, false
+		return "", time.Time{}, time.Time{}, false, 0
 	}
-	return payload, now, expires, true
+	return payload, now, expires, true, 0
 }
 
 // isNotFound reports a 404: the record does not exist, which is

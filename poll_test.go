@@ -107,7 +107,16 @@ func (f *fakeESI) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		var out []esiName
 		for _, id := range req.IDs {
-			out = append(out, esiName{ID: id, Name: fmt.Sprintf("Type %d", id)})
+			switch id {
+			case 999999:
+				// ESI refuses a batch naming any ID it cannot resolve.
+				http.NotFound(w, r)
+				return
+			case 90000001:
+				out = append(out, esiName{ID: id, Name: "Some Pilot", Category: "character"})
+			default:
+				out = append(out, esiName{ID: id, Name: fmt.Sprintf("Type %d", id), Category: "inventory_type"})
+			}
 		}
 		w.Header().Set("Expires", future)
 		_ = json.NewEncoder(w).Encode(out)

@@ -30,6 +30,14 @@ Player structure names are never fetched: that endpoint needs a
 token, and this node holds none by design. The main instance keeps
 serving those itself.
 
+Beyond the routine sweep, a pull is also demand: when a peer asks
+for a key of a covered kind (`market_history`, `type_name`,
+`corporation_record`, `alliance_record`) and this node misses, the
+key queues, the next poll pass fetches it before routine warming
+(at most 100 per pass, a failed key backing off an hour), and a
+later pull serves it. A key nobody asks for again within a day is
+dropped unfetched.
+
 Everything persists in one SQLite file. A restart reopens warm —
 nothing refetches while its `Expires` (or the 20-hour history
 gate) holds.
@@ -75,7 +83,12 @@ address.
   JSON, ≤50 keys, 1 MiB cap) and returns `{"entries": […]}` —
   never null. Unknown kinds and unheld keys are skipped
   silently. Entries are signed at serve time over the row's own
-  fetch time.
+  fetch time. A miss on a covered kind queues the key as demand;
+  the response does not change.
+- `GET /swarm/warms` returns `{"kinds": [...]}` and nothing else
+  — the kinds this node fetches on demand, for the main
+  instance's swarm-first warming. `structure_name` is never
+  listed. Older nodes answer 404, read as covering nothing.
 - `POST /swarm/seed/register` files one heartbeat, mirroring the
   Cloudflare seed worker (same shapes, same status codes): a
   self-signed `announce` entry whose payload names an `https`

@@ -2,17 +2,20 @@ package main
 
 // ---------------------------------------------------------------------------
 // The swarm HTTP API: how the main instance talks to this node.
-// Three endpoints, all secret-gated, all dark (404) to anything
+// Four endpoints, all secret-gated, all dark (404) to anything
 // else:
 //
 //   GET  /swarm/members       — this node plus its seed directory
+//   GET  /swarm/warms         — the kinds this node fetches on demand
 //   POST /swarm/pull          — signed public-data entries for wanted keys
 //   POST /swarm/seed/register — file one heartbeat in the directory
 //
 // Pulls serve what callers ask for from what the poll loop holds
 // fresh, and nothing else. Unknown kinds and keys it does not
 // hold are skipped silently, so the response never says what is
-// missing — only what is shared. Registration mirrors the
+// missing — only what is shared. A miss on a covered kind is
+// also demand: the key queues for the poll loop (warm.go), and a
+// later pull serves it. Registration mirrors the
 // Cloudflare seed worker field for field (codes included), so
 // any instance that announces to the worker announces here.
 // Behavior otherwise mirrors the main instance's swarm_api.go:
@@ -42,7 +45,7 @@ func newServer(cfg config, poller *poller, id *swarmIdentity) *server {
 	return &server{cfg: cfg, poller: poller, id: id}
 }
 
-// handler routes the three swarm endpoints. Anything else is
+// handler routes the four swarm endpoints. Anything else is
 // dark: 404, the way a disabled instance answers.
 func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
@@ -50,6 +53,8 @@ func (s *server) handler() http.Handler {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/swarm/members":
 			s.handleMembers(w, r)
+		case r.Method == http.MethodGet && r.URL.Path == "/swarm/warms":
+			s.handleWarms(w, r)
 		case r.Method == http.MethodPost && r.URL.Path == "/swarm/pull":
 			s.handlePull(w, r)
 		case r.Method == http.MethodPost && r.URL.Path == "/swarm/seed/register":
@@ -113,8 +118,19 @@ func (s *server) handleMembers(w http.ResponseWriter, r *http.Request) {
 	writeSwarmJSON(w, map[string]any{"entry": entry})
 }
 
+// handleWarms announces this node's coverage: {"kinds": [...]}
+// and nothing else — the main instance decodes it strictly.
+// Unconditional: a dedicated node always covers its kinds.
+func (s *server) handleWarms(w http.ResponseWriter, r *http.Request) {
+	if !swarmAuth(s.cfg.secret, r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	writeSwarmJSON(w, map[string]any{"kinds": warmKinds})
+}
+
 // handlePull serves the signed entries for the requested keys
-// this node holds fresh.
+// this node holds fresh, and queues each covered miss as demand.
 func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
 	if !swarmAuth(s.cfg.secret, r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
@@ -138,6 +154,10 @@ func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
 		}
 		payload, fetchedAt, ok := s.poller.serveKey(ctx, k.Kind, k.Key, now)
 		if !ok {
+			// The miss still answers nothing; it only queues.
+			if demandable(k.Kind, k.Key) {
+				_ = s.poller.store.noteDemand(k.Kind, k.Key, now)
+			}
 			continue
 		}
 		entry, err := signSwarmEntry(s.id, s.id.id, k.Kind, k.Key, payload, fetchedAt)
