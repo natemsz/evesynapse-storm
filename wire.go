@@ -115,22 +115,26 @@ type swarmMember struct {
 	InstanceID string `json:"instance_id"`
 	BaseURL    string `json:"base_url"`
 	PublicKey  string `json:"public_key"`
-	// URLSig is the member's own signature over its ID and
-	// address (swarmMemberMessage), made with the key beside it.
-	// A tuple is relayed exactly as its owner issued it.
-	URLSig string `json:"url_sig"`
+	// URLSig is the member's own signature over its ID, address
+	// and IssuedAt (swarmMemberMessage), made with the key beside
+	// it. A tuple is relayed exactly as its owner issued it.
+	// IssuedAt is the owner's unix clock when it signed: of two
+	// tuples for one member the later-issued is the current one.
+	URLSig   string `json:"url_sig"`
+	IssuedAt int64  `json:"issued_at"`
 }
 
 // swarmMemberMessage is what a member signs to own its address:
-// "member\n" + instance ID + "\n" + base URL. Byte-for-byte the
-// main instance's function of the same name.
-func swarmMemberMessage(instanceID, baseURL string) []byte {
-	return []byte("member\n" + instanceID + "\n" + baseURL)
+// "member\n" + instance ID + "\n" + base URL + "\n" + the unix
+// time it was issued, in decimal. Byte-for-byte the main
+// instance's function of the same name.
+func swarmMemberMessage(instanceID, baseURL string, issuedAt int64) []byte {
+	return []byte("member\n" + instanceID + "\n" + baseURL + "\n" + strconv.FormatInt(issuedAt, 10))
 }
 
-// signSwarmMember signs this node's own address.
-func signSwarmMember(id *swarmIdentity, baseURL string) string {
-	return base64.StdEncoding.EncodeToString(ed25519.Sign(id.private, swarmMemberMessage(id.id, baseURL)))
+// signSwarmMember signs this node's own address as of issuedAt.
+func signSwarmMember(id *swarmIdentity, baseURL string, issuedAt int64) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(id.private, swarmMemberMessage(id.id, baseURL, issuedAt)))
 }
 
 // verifySwarmMember checks a tuple's address signature against
@@ -144,7 +148,7 @@ func verifySwarmMember(m swarmMember) bool {
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return false
 	}
-	return ed25519.Verify(pub, swarmMemberMessage(m.InstanceID, m.BaseURL), sig)
+	return ed25519.Verify(pub, swarmMemberMessage(m.InstanceID, m.BaseURL, m.IssuedAt), sig)
 }
 
 // swarmPullRequest is one pull: the keys the caller wants.
@@ -166,6 +170,7 @@ type seedAnnouncePayload struct {
 	BaseURL   string `json:"base_url"`
 	PublicKey string `json:"public_key"`
 	URLSig    string `json:"url_sig"`
+	IssuedAt  int64  `json:"issued_at"`
 }
 
 // The payload schemas, copied from the main instance's

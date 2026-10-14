@@ -84,11 +84,12 @@ func (s *server) handleMembers(w http.ResponseWriter, r *http.Request) {
 	members := []swarmMember{{
 		InstanceID: s.id.id, BaseURL: s.cfg.publicBaseURL,
 		PublicKey: s.id.publicString(),
-		URLSig:    signSwarmMember(s.id, s.cfg.publicBaseURL),
+		URLSig:    signSwarmMember(s.id, s.cfg.publicBaseURL, now.Unix()),
+		IssuedAt:  now.Unix(),
 	}}
 	for _, p := range peers {
 		members = append(members, swarmMember{
-			InstanceID: p.instanceID, BaseURL: p.baseURL, PublicKey: p.publicKey, URLSig: p.urlSig,
+			InstanceID: p.instanceID, BaseURL: p.baseURL, PublicKey: p.publicKey, URLSig: p.urlSig, IssuedAt: p.issuedAt,
 		})
 	}
 	raw, err := json.Marshal(members)
@@ -212,7 +213,7 @@ func (s *server) handleSeedRegister(w http.ResponseWriter, r *http.Request) {
 	// The member tuple itself: the sender's signature over its
 	// ID and address, under the same key. It is what gets stored
 	// and relayed, so it is checked before it is kept.
-	if !verifySwarmMember(swarmMember{InstanceID: entry.Signer, BaseURL: detail.BaseURL, PublicKey: detail.PublicKey, URLSig: detail.URLSig}) {
+	if !verifySwarmMember(swarmMember{InstanceID: entry.Signer, BaseURL: detail.BaseURL, PublicKey: detail.PublicKey, URLSig: detail.URLSig, IssuedAt: detail.IssuedAt}) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -241,7 +242,7 @@ func (s *server) handleSeedRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := store.upsertSeedPeer(entry.Signer, detail.BaseURL, detail.PublicKey, detail.URLSig, now); err != nil {
+	if err := store.upsertSeedPeer(entry.Signer, detail.BaseURL, detail.PublicKey, detail.URLSig, detail.IssuedAt, now); err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
