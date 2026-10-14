@@ -26,11 +26,11 @@ package main
 // ---------------------------------------------------------------------------
 
 import (
-	"log"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -378,7 +378,7 @@ func (p *poller) heartbeatDue(ctx context.Context, now time.Time) {
 			return
 		}
 	}
-	entry, err := signSwarmEntry(p.id, p.id.id, swarmAnnounceKind, p.id.id, announcePayload(p.cfg.publicBaseURL, p.id.publicString()), now)
+	entry, err := signSwarmEntry(p.id, p.id.id, swarmAnnounceKind, p.id.id, announcePayload(p.id, p.cfg.publicBaseURL, now.Unix()), now)
 	if err != nil {
 		log.Printf("warmer: heartbeat sign failed: %v", err)
 		return
@@ -391,9 +391,10 @@ func (p *poller) heartbeatDue(ctx context.Context, now time.Time) {
 	_ = p.store.putMeta("last_heartbeat", now.UTC().Format(time.RFC3339))
 }
 
-// announcePayload seals the heartbeat's address and key.
-func announcePayload(baseURL, publicKey string) string {
-	raw, err := json.Marshal(seedAnnouncePayload{BaseURL: baseURL, PublicKey: publicKey})
+// announcePayload seals the heartbeat's member tuple: the
+// address, the key, and the node's signature over the address.
+func announcePayload(id *swarmIdentity, baseURL string, issuedAt int64) string {
+	raw, err := json.Marshal(seedAnnouncePayload{BaseURL: baseURL, PublicKey: id.publicString(), URLSig: signSwarmMember(id, baseURL, issuedAt), IssuedAt: issuedAt})
 	if err != nil {
 		return ""
 	}

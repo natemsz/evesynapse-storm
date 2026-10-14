@@ -13,6 +13,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -128,6 +129,19 @@ func openStore(path string) (*store, error) {
 			continue
 		}
 		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("warmer: db schema: %w", err)
+		}
+	}
+	// seed_peers gained url_sig and url_issued_at after the first release. SQLite
+	// has no ADD COLUMN IF NOT EXISTS: a database that already
+	// has the column answers "duplicate column name", which is
+	// the success case.
+	for _, stmt := range []string{
+		`ALTER TABLE seed_peers ADD COLUMN url_sig TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE seed_peers ADD COLUMN url_issued_at INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			db.Close()
 			return nil, fmt.Errorf("warmer: db schema: %w", err)
 		}
@@ -430,15 +444,27 @@ type seedPeer struct {
 	instanceID    string
 	baseURL       string
 	publicKey     string
+	urlSig        string
+	issuedAt      int64
 	lastHeartbeat time.Time
 }
 
 // upsertSeedPeer files one heartbeat: a re-announce refreshes
-// the address, the key, and the 48-hour listing.
-func (s *store) upsertSeedPeer(instanceID, baseURL, publicKey string, now time.Time) error {
-	if _, err := s.db.Exec(`INSERT INTO seed_peers(instance_id, base_url, public_key, last_heartbeat) VALUES(?, ?, ?, ?)
-		ON CONFLICT(instance_id) DO UPDATE SET base_url = excluded.base_url, public_key = excluded.public_key, last_heartbeat = excluded.last_heartbeat`,
-		instanceID, baseURL, publicKey, now.UTC().Unix()); err != nil {
+// the 48-hour listing, and replaces the address, its signature
+// and issue time only when the tuple was issued later than the
+// one held (an older tuple, however valid, never moves an
+// address back). The key is written once: a listed ID keeps the
+// key it registered with (the handler refuses a different one
+// before this is reached).
+func (s *store) upsertSeedPeer(instanceID, baseURL, publicKey, urlSig string, issuedAt int64, now time.Time) error {
+	if _, err := s.db.Exec(`INSERT INTO seed_peers(instance_id, base_url, public_key, url_sig, url_issued_at, last_heartbeat) VALUES(?, ?, ?, ?, ?, ?)
+		ON CONFLICT(instance_id) DO UPDATE SET
+			base_url = CASE WHEN excluded.url_issued_at > seed_peers.url_issued_at THEN excluded.base_url ELSE seed_peers.base_url END,
+			url_sig = CASE WHEN excluded.url_issued_at > seed_peers.url_issued_at THEN excluded.url_sig ELSE seed_peers.url_sig END,
+			url_issued_at = MAX(excluded.url_issued_at, seed_peers.url_issued_at),
+			last_heartbeat = excluded.last_heartbeat
+		WHERE seed_peers.public_key = excluded.public_key`,
+		instanceID, baseURL, publicKey, urlSig, issuedAt, now.UTC().Unix()); err != nil {
 		return fmt.Errorf("warmer: file heartbeat: %w", err)
 	}
 	return nil
@@ -453,6 +479,18 @@ func (s *store) countSeedPeers() (int, error) {
 	return n, nil
 }
 
+// seedPeerKey returns the key a listed ID registered with.
+func (s *store) seedPeerKey(instanceID string) (key string, listed bool, err error) {
+	err = s.db.QueryRow(`SELECT public_key FROM seed_peers WHERE instance_id = ?`, instanceID).Scan(&key)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("warmer: check directory: %w", err)
+	}
+	return key, true, nil
+}
+
 // hasSeedPeer reports whether one ID is already listed.
 func (s *store) hasSeedPeer(instanceID string) (bool, error) {
 	var n int
@@ -465,8 +503,10 @@ func (s *store) hasSeedPeer(instanceID string) (bool, error) {
 // listSeedPeers reads the fresh listings, freshest heartbeat
 // first, bounded — the worker's order and cap.
 func (s *store) listSeedPeers(now time.Time, limit int) ([]seedPeer, error) {
-	rows, err := s.db.Query(`SELECT instance_id, base_url, public_key, last_heartbeat FROM seed_peers
-		WHERE last_heartbeat > ? ORDER BY last_heartbeat DESC LIMIT ?`, now.Add(-seedPeerTTL).UTC().Unix(), limit)
+	// A listing with no address signature (filed before tuples
+	// were signed) has nothing that may be relayed.
+	rows, err := s.db.Query(`SELECT instance_id, base_url, public_key, url_sig, url_issued_at, last_heartbeat FROM seed_peers
+		WHERE last_heartbeat > ? AND url_sig != '' ORDER BY last_heartbeat DESC LIMIT ?`, now.Add(-seedPeerTTL).UTC().Unix(), limit)
 	if err != nil {
 		return nil, fmt.Errorf("warmer: read directory: %w", err)
 	}
@@ -475,7 +515,7 @@ func (s *store) listSeedPeers(now time.Time, limit int) ([]seedPeer, error) {
 	for rows.Next() {
 		var p seedPeer
 		var unix int64
-		if err := rows.Scan(&p.instanceID, &p.baseURL, &p.publicKey, &unix); err != nil {
+		if err := rows.Scan(&p.instanceID, &p.baseURL, &p.publicKey, &p.urlSig, &p.issuedAt, &unix); err != nil {
 			return nil, fmt.Errorf("warmer: read directory: %w", err)
 		}
 		p.lastHeartbeat = time.Unix(unix, 0).UTC()
