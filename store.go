@@ -89,6 +89,15 @@ CREATE TABLE IF NOT EXISTS seed_peers(
 	last_heartbeat INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_seed_peers_heartbeat ON seed_peers(last_heartbeat);
+CREATE TABLE IF NOT EXISTS swarm_demand(
+	kind        TEXT NOT NULL,
+	swarm_key   TEXT NOT NULL,
+	first_asked INTEGER NOT NULL,
+	last_asked  INTEGER NOT NULL,
+	retry_at    INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY(kind, swarm_key)
+);
+CREATE INDEX IF NOT EXISTS idx_swarm_demand_asked ON swarm_demand(last_asked);
 `
 
 // Seed directory bounds, mirroring the Cloudflare seed worker:
@@ -531,6 +540,126 @@ func (s *store) listSeedPeers(now time.Time, limit int) ([]seedPeer, error) {
 func (s *store) pruneSeedPeers(now time.Time) error {
 	if _, err := s.db.Exec(`DELETE FROM seed_peers WHERE last_heartbeat <= ?`, now.Add(-seedPeerTTL).UTC().Unix()); err != nil {
 		return fmt.Errorf("warmer: prune directory: %w", err)
+	}
+	return nil
+}
+
+// Demand bounds: a key nobody has asked for in a day is dropped
+// unfetched — silently, it is not a failure against anyone — and
+// the queue never holds more than this many keys.
+const (
+	demandTTL     = 24 * time.Hour
+	maxDemandRows = 10000
+)
+
+// demandRow is one covered key a peer pulled and this node
+// missed.
+type demandRow struct {
+	kind       string
+	key        string
+	firstAsked time.Time
+	lastAsked  time.Time
+	retryAt    time.Time
+}
+
+// noteDemand records one missed pull: a new key queues, a key
+// already queued only refreshes its last-asked time (its backoff
+// stands). A full queue drops new keys.
+func (s *store) noteDemand(kind, key string, now time.Time) error {
+	res, err := s.db.Exec(`UPDATE swarm_demand SET last_asked = ? WHERE kind = ? AND swarm_key = ?`, now.UTC().Unix(), kind, key)
+	if err != nil {
+		return fmt.Errorf("warmer: refresh demand: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		return nil
+	}
+	if _, err := s.db.Exec(`INSERT INTO swarm_demand(kind, swarm_key, first_asked, last_asked, retry_at)
+		SELECT ?, ?, ?, ?, 0 WHERE (SELECT COUNT(*) FROM swarm_demand) < ?
+		ON CONFLICT(kind, swarm_key) DO UPDATE SET last_asked = excluded.last_asked`,
+		kind, key, now.UTC().Unix(), now.UTC().Unix(), maxDemandRows); err != nil {
+		return fmt.Errorf("warmer: record demand: %w", err)
+	}
+	return nil
+}
+
+// scanDemand reads one demand row from a query result.
+func scanDemand(scan func(dest ...any) error) (demandRow, error) {
+	var d demandRow
+	var first, last, retry int64
+	if err := scan(&d.kind, &d.key, &first, &last, &retry); err != nil {
+		return demandRow{}, err
+	}
+	d.firstAsked = time.Unix(first, 0).UTC()
+	d.lastAsked = time.Unix(last, 0).UTC()
+	d.retryAt = time.Unix(retry, 0).UTC()
+	return d, nil
+}
+
+// dueDemand lists the queued keys whose backoff has lapsed,
+// oldest demand first, bounded.
+func (s *store) dueDemand(now time.Time, limit int) ([]demandRow, error) {
+	rows, err := s.db.Query(`SELECT kind, swarm_key, first_asked, last_asked, retry_at FROM swarm_demand
+		WHERE retry_at <= ? ORDER BY first_asked, kind, swarm_key LIMIT ?`, now.UTC().Unix(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("warmer: read demand: %w", err)
+	}
+	defer rows.Close()
+	var out []demandRow
+	for rows.Next() {
+		d, err := scanDemand(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("warmer: read demand: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("warmer: read demand: %w", err)
+	}
+	return out, nil
+}
+
+// getDemand reads one queued key (ok false when not queued).
+func (s *store) getDemand(kind, key string) (demandRow, bool, error) {
+	d, err := scanDemand(s.db.QueryRow(`SELECT kind, swarm_key, first_asked, last_asked, retry_at FROM swarm_demand
+		WHERE kind = ? AND swarm_key = ?`, kind, key).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return demandRow{}, false, nil
+	}
+	if err != nil {
+		return demandRow{}, false, fmt.Errorf("warmer: read demand: %w", err)
+	}
+	return d, true, nil
+}
+
+// countDemand reports the queue size.
+func (s *store) countDemand() (int, error) {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM swarm_demand`).Scan(&n); err != nil {
+		return 0, fmt.Errorf("warmer: count demand: %w", err)
+	}
+	return n, nil
+}
+
+// deferDemand holds one queued key back until retryAt.
+func (s *store) deferDemand(kind, key string, retryAt time.Time) error {
+	if _, err := s.db.Exec(`UPDATE swarm_demand SET retry_at = ? WHERE kind = ? AND swarm_key = ?`, retryAt.UTC().Unix(), kind, key); err != nil {
+		return fmt.Errorf("warmer: defer demand: %w", err)
+	}
+	return nil
+}
+
+// deleteDemand drops one queued key: fetched, or already held.
+func (s *store) deleteDemand(kind, key string) error {
+	if _, err := s.db.Exec(`DELETE FROM swarm_demand WHERE kind = ? AND swarm_key = ?`, kind, key); err != nil {
+		return fmt.Errorf("warmer: drop demand: %w", err)
+	}
+	return nil
+}
+
+// pruneDemand drops keys nobody has asked for within the TTL.
+func (s *store) pruneDemand(now time.Time) error {
+	if _, err := s.db.Exec(`DELETE FROM swarm_demand WHERE last_asked <= ?`, now.Add(-demandTTL).UTC().Unix()); err != nil {
+		return fmt.Errorf("warmer: prune demand: %w", err)
 	}
 	return nil
 }
