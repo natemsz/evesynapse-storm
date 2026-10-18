@@ -31,8 +31,11 @@ import (
 )
 
 // version is the warmer's release. It travels in the User-Agent
-// so CCP can tell this client apart from the main instance.
-const version = "0.1.0"
+// so CCP can tell this client apart from the main instance. The
+// release workflow stamps it from the git tag (-ldflags -X), so
+// the tag is the single source of truth for a release's version;
+// the value here is only the default for unstamped local builds.
+var version = "0.1.0"
 
 // esiBase is CCP's production API. Tests override it through
 // newESIClientWithBase.

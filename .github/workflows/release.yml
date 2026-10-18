@@ -14,12 +14,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27'
-      - run: GOOS=linux GOARCH=amd64 go build -trimpath -o storm-amd64 .
+      - name: Build amd64 (version stamped from the tag)
         env:
           CGO_ENABLED: '0'
-      - run: GOOS=linux GOARCH=arm64 go build -trimpath -o storm-arm64 .
+        run: GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X main.version=${GITHUB_REF_NAME#v}" -o storm-amd64 .
+      - name: Build arm64 (version stamped from the tag)
         env:
           CGO_ENABLED: '0'
+        run: GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-X main.version=${GITHUB_REF_NAME#v}" -o storm-arm64 .
       - run: tar -czf storm-linux-amd64.tar.gz storm-amd64 setup.sh
       - run: tar -czf storm-linux-arm64.tar.gz storm-arm64 setup.sh
       - run: sha256sum storm-amd64 storm-arm64 storm-linux-amd64.tar.gz storm-linux-arm64.tar.gz > SHA256SUMS
