@@ -122,6 +122,12 @@ type swarmMember struct {
 	// tuples for one member the later-issued is the current one.
 	URLSig   string `json:"url_sig"`
 	IssuedAt int64  `json:"issued_at"`
+	// Build is the member's self-reported build claim (main
+	// instance, swarm/build.go), carried for the receiver's
+	// admin display only. It is not part of the signed
+	// address tuple — the signature covers ID, address and
+	// IssuedAt — and nothing here acts on it.
+	Build string `json:"build,omitempty"`
 }
 
 // swarmMemberMessage is what a member signs to own its address:
@@ -171,6 +177,10 @@ type seedAnnouncePayload struct {
 	PublicKey string `json:"public_key"`
 	URLSig    string `json:"url_sig"`
 	IssuedAt  int64  `json:"issued_at"`
+	// Build is the sender's self-reported build claim:
+	// display metadata a receiver may file on the peer row.
+	// Outside the signed address tuple, acted on nowhere.
+	Build string `json:"build,omitempty"`
 }
 
 // The payload schemas, copied from the main instance's
