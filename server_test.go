@@ -9,10 +9,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -267,5 +270,198 @@ func TestPullServesOnlyFreshHistory(t *testing.T) {
 	}
 	if strings.TrimSpace(rec.Body.String()) != `{"entries":[]}` {
 		t.Errorf("stale pair served: %s", rec.Body.String())
+	}
+}
+
+// registerPuller files one puller identity in the seed
+// directory, the listing signedPullValid looks its key up in.
+func registerPuller(t *testing.T, srv *server, puller *swarmIdentity) {
+	t.Helper()
+	now := time.Now().UTC()
+	sig := signSwarmMember(puller, "https://puller.example.com", now.Unix())
+	if err := srv.poller.store.upsertSeedPeer(puller.id, "https://puller.example.com", puller.publicString(), sig, now.Unix(), now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// signedPullRequest builds one pull request signed the way a
+// migrated puller signs it: the Ed25519 signature over
+// swarmPullMessage for the exact body bytes sent.
+func signedPullRequest(t *testing.T, puller *swarmIdentity, body []byte, ts time.Time) *http.Request {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/swarm/pull", bytes.NewReader(body))
+	sig := ed25519.Sign(puller.private, swarmPullMessage(puller.id, ts.Unix(), body))
+	r.Header.Set("X-Swarm-Instance", puller.id)
+	r.Header.Set("X-Swarm-Timestamp", strconv.FormatInt(ts.Unix(), 10))
+	r.Header.Set("X-Swarm-Signature", base64.StdEncoding.EncodeToString(sig))
+	return r
+}
+
+func pullCounter(t *testing.T, srv *server, key string) string {
+	t.Helper()
+	v, err := srv.poller.store.getMeta(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func pullBody(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(swarmPullRequest{Keys: []swarmPullKey{{Kind: swarmKindTypeName, Key: "34"}}}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestSignedPullServesRegisteredPeer proves the signed path on
+// its own — no bearer at all — serves a listed puller and
+// counts the pull as signed, never as legacy.
+func TestSignedPullServesRegisteredPeer(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerPuller(t, srv, puller)
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, signedPullRequest(t, puller, pullBody(t), time.Now().UTC()))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signed pull: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Tritanium") {
+		t.Errorf("signed pull served %s, want the held type name", rec.Body.String())
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "1" {
+		t.Errorf("pull_auth_signed = %q, want 1", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "" {
+		t.Errorf("pull_auth_legacy = %q, want unset", got)
+	}
+}
+
+// TestSignedPullBadSignatureFallsBackToBearer proves a failed
+// signature is only an auth failure on that path: with a valid
+// bearer the pull still serves, counted as legacy.
+func TestSignedPullBadSignatureFallsBackToBearer(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerPuller(t, srv, puller)
+	body := pullBody(t)
+	r := signedPullRequest(t, puller, body, time.Now().UTC())
+	// Corrupt the signature without changing its shape.
+	r.Header.Set("X-Swarm-Signature", base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)))
+	r.Header.Set("Authorization", "Bearer "+testSecret)
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bad signature + bearer: status %d", rec.Code)
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "" {
+		t.Errorf("pull_auth_signed = %q, want unset", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "1" {
+		t.Errorf("pull_auth_legacy = %q, want 1", got)
+	}
+}
+
+// TestSignedPullBadSignatureNoBearer proves the fallback is
+// the whole story: a bad signature with no bearer is the old
+// 403, and counts nothing.
+func TestSignedPullBadSignatureNoBearer(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerPuller(t, srv, puller)
+	r := signedPullRequest(t, puller, pullBody(t), time.Now().UTC())
+	r.Header.Set("X-Swarm-Signature", base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)))
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("bad signature, no bearer: status %d, want 403", rec.Code)
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "" {
+		t.Errorf("pull_auth_signed = %q, want unset after a 403", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "" {
+		t.Errorf("pull_auth_legacy = %q, want unset after a 403", got)
+	}
+}
+
+// TestSignedPullUnregisteredInstance proves a self-consistent
+// signature from an instance the directory does not list
+// proves nothing: 403 without a bearer.
+func TestSignedPullUnregisteredInstance(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately not registered.
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, signedPullRequest(t, puller, pullBody(t), time.Now().UTC()))
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("unregistered signed pull: status %d, want 403", rec.Code)
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "" {
+		t.Errorf("pull_auth_signed = %q, want unset", got)
+	}
+}
+
+// TestSignedPullStaleTimestamp proves the freshness window: a
+// signature over the right bytes at a stale time is invalid —
+// 403 alone, and a legacy serve when the bearer rides along.
+func TestSignedPullStaleTimestamp(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerPuller(t, srv, puller)
+	stale := time.Now().UTC().Add(-pullAuthWindow - time.Minute)
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, signedPullRequest(t, puller, pullBody(t), stale))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("stale signed pull: status %d, want 403", rec.Code)
+	}
+	r := signedPullRequest(t, puller, pullBody(t), stale)
+	r.Header.Set("Authorization", "Bearer "+testSecret)
+	rec = httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stale signature + bearer: status %d, want 200", rec.Code)
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "" {
+		t.Errorf("pull_auth_signed = %q, want unset", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "1" {
+		t.Errorf("pull_auth_legacy = %q, want 1", got)
+	}
+}
+
+// TestPullLegacyBearerAloneStillServes proves the pre-signed
+// path is untouched: bearer alone serves and counts as legacy.
+func TestPullLegacyBearerAloneStillServes(t *testing.T) {
+	srv, _ := testRig(t)
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(swarmPullRequest{Keys: []swarmPullKey{{Kind: swarmKindTypeName, Key: "34"}}}); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, authed(http.MethodPost, "/swarm/pull", &buf))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy pull: status %d", rec.Code)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "1" {
+		t.Errorf("pull_auth_legacy = %q, want 1", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "" {
+		t.Errorf("pull_auth_signed = %q, want unset", got)
 	}
 }

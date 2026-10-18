@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -189,6 +190,24 @@ func (s *store) getMeta(key string) (string, error) {
 		return "", fmt.Errorf("warmer: read meta: %w", err)
 	}
 	return v, nil
+}
+
+// bumpMeta increments one integer counter held in meta,
+// treating an unset key as zero. The store's single connection
+// serializes the read-modify-write, so concurrent handlers
+// cannot lose an increment between the read and the write.
+func (s *store) bumpMeta(key string) error {
+	cur, err := s.getMeta(key)
+	if err != nil {
+		return err
+	}
+	var n int64
+	if cur != "" {
+		if parsed, err := strconv.ParseInt(cur, 10, 64); err == nil {
+			n = parsed
+		}
+	}
+	return s.putMeta(key, strconv.FormatInt(n+1, 10))
 }
 
 // putMeta writes one meta value.

@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -401,6 +402,38 @@ func verifySwarmEntry(entry swarmSignedEntry, publicKey string) bool {
 		return false
 	}
 	return ed25519.Verify(pub, doc, sig)
+}
+
+// swarmPullMessage is what a puller signs to authenticate one
+// pull request: "pull\n" + instance ID + "\n" + the unix
+// timestamp in decimal + "\n" + the lowercase hex SHA-256 of
+// the exact request body bytes. Hashing the body binds the
+// signature to this one request — a captured signature cannot
+// be replayed over a different key list — and the timestamp
+// bounds replay of the identical request to the freshness
+// window the server enforces. Byte-for-byte the main
+// instance's function of the same name: both sides must build
+// identical bytes or every signed pull fails verification.
+func swarmPullMessage(instanceID string, timestamp int64, body []byte) []byte {
+	sum := sha256.Sum256(body)
+	return []byte("pull\n" + instanceID + "\n" + strconv.FormatInt(timestamp, 10) + "\n" + hex.EncodeToString(sum[:]))
+}
+
+// verifySwarmPull checks one pull signature against the
+// claimed instance's directory key. Every failure is false,
+// with no reason given: a bad encoding, a wrong-sized key or
+// signature, and a signature that does not verify are the same
+// answer to the caller (the server falls back to the bearer).
+func verifySwarmPull(publicKey, instanceID string, timestamp int64, body []byte, signature string) bool {
+	pub, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	sig, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return false
+	}
+	return ed25519.Verify(pub, swarmPullMessage(instanceID, timestamp, body), sig)
 }
 
 // swarmAuth checks the request's Bearer against the shared

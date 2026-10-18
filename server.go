@@ -2,8 +2,9 @@ package main
 
 // ---------------------------------------------------------------------------
 // The swarm HTTP API: how the main instance talks to this node.
-// Four endpoints, all secret-gated, all dark (404) to anything
-// else:
+// Four endpoints, all gated (the bearer secret, or a directory-
+// verified pull signature on /swarm/pull), all dark (404) to
+// anything else:
 //
 //   GET  /swarm/members       — this node plus its seed directory
 //   GET  /swarm/warms         — the kinds this node fetches on demand
@@ -27,8 +28,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -129,15 +132,95 @@ func (s *server) handleWarms(w http.ResponseWriter, r *http.Request) {
 	writeSwarmJSON(w, map[string]any{"kinds": warmKinds})
 }
 
+// pullAuthWindow is how far a signed pull's timestamp may
+// drift from the server clock, in either direction. Five
+// minutes covers ordinary clock skew between two instances
+// while keeping a captured signature's replay window short.
+const pullAuthWindow = 5 * time.Minute
+
+// signedPullValid reports whether the request's three signed-
+// pull headers prove the claimed instance: the instance must
+// be listed in the seed directory, the timestamp must sit
+// inside pullAuthWindow of now, and the signature must verify
+// under the directory key over the message built from the
+// exact received body bytes. Any failure is simply false —
+// the caller falls back to the bearer, and a failed signature
+// is never anything more than an auth failure.
+func (s *server) signedPullValid(instanceID, timestampRaw, signature string, body []byte, now time.Time) bool {
+	ts, err := strconv.ParseInt(strings.TrimSpace(timestampRaw), 10, 64)
+	if err != nil {
+		return false
+	}
+	diff := now.Unix() - ts
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > int64(pullAuthWindow/time.Second) {
+		return false
+	}
+	key, listed, err := s.poller.store.seedPeerKey(instanceID)
+	if err != nil || !listed {
+		return false
+	}
+	return verifySwarmPull(key, instanceID, ts, body, signature)
+}
+
 // handlePull serves the signed entries for the requested keys
 // this node holds fresh, and queues each covered miss as demand.
+//
+// Auth is dual-path while pullers migrate to signed requests.
+// A request carrying all three X-Swarm-* headers is checked
+// against the seed directory first: a listed instance, a fresh
+// timestamp, and a signature over the exact body bytes serve
+// without the shared secret ever crossing the wire. Absent or
+// invalid signed headers fall back to the legacy bearer check
+// unchanged — a peer that has not upgraded yet still pulls, and
+// a bad signature alone never locks anyone out. Neither path
+// passing is 403, exactly as before. Every served pull counts
+// once, under the path that authorized it, in meta
+// (pull_auth_signed / pull_auth_legacy): the counters are how
+// an operator sees the migration actually happen, and when the
+// legacy count reaches zero the bearer could be retired.
+// 403s and unreadable bodies count nothing — they served
+// nothing.
 func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
-	if !swarmAuth(s.cfg.secret, r) {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	// The body is read once, up front and size-capped the way
+	// handleSeedRegister reads its body: the signed path hashes
+	// the exact bytes received, so verification and decoding
+	// must both run over this one copy, never a re-read.
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxSwarmBodyBytes+1))
+	_ = r.Body.Close()
+	if err != nil || len(raw) > maxSwarmBodyBytes {
+		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	now := time.Now().UTC()
+	authKind := ""
+	instanceID := r.Header.Get("X-Swarm-Instance")
+	timestampRaw := r.Header.Get("X-Swarm-Timestamp")
+	signature := r.Header.Get("X-Swarm-Signature")
+	if instanceID != "" && timestampRaw != "" && signature != "" {
+		if s.signedPullValid(instanceID, timestampRaw, signature, raw, now) {
+			authKind = "signed"
+		} else {
+			// Logged once for visibility — a peer whose
+			// clock or key drifted is otherwise invisible,
+			// silently riding the bearer — and nothing
+			// more: the bearer decides below.
+			log.Printf("warmer: pull: signed auth failed for instance %q, falling back to bearer", instanceID)
+		}
+	}
+	if authKind == "" {
+		if !swarmAuth(s.cfg.secret, r) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		authKind = "legacy"
+	}
 	var req swarmPullRequest
-	if err := readSwarmJSON(r, &req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -146,7 +229,6 @@ func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	now := time.Now().UTC()
 	entries := []swarmSignedEntry{}
 	for _, k := range req.Keys {
 		if !validPullKey(k.Kind, k.Key) {
@@ -165,6 +247,14 @@ func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		entries = append(entries, entry)
+	}
+	// One count per served pull, under the path that
+	// authorized it — not per key, and never for a 403 or a
+	// body that never decoded.
+	if authKind == "signed" {
+		_ = s.poller.store.bumpMeta("pull_auth_signed")
+	} else {
+		_ = s.poller.store.bumpMeta("pull_auth_legacy")
 	}
 	writeSwarmJSON(w, map[string]any{"entries": entries})
 }
