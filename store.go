@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,6 +99,43 @@ CREATE TABLE IF NOT EXISTS swarm_demand(
 	PRIMARY KEY(kind, swarm_key)
 );
 CREATE INDEX IF NOT EXISTS idx_swarm_demand_asked ON swarm_demand(last_asked);
+CREATE TABLE IF NOT EXISTS contracts(
+	contract_id           INTEGER PRIMARY KEY,
+	region_id             INTEGER NOT NULL,
+	type                  TEXT NOT NULL,
+	issuer_id             INTEGER NOT NULL,
+	issuer_corporation_id INTEGER NOT NULL,
+	for_corporation       INTEGER NOT NULL,
+	title                 TEXT NOT NULL,
+	price                 REAL NOT NULL,
+	buyout                REAL NOT NULL,
+	reward                REAL NOT NULL,
+	collateral            REAL NOT NULL,
+	volume                REAL NOT NULL,
+	start_location_id     INTEGER NOT NULL,
+	end_location_id       INTEGER NOT NULL,
+	date_issued           INTEGER NOT NULL,
+	date_expired          INTEGER NOT NULL,
+	days_to_complete      INTEGER NOT NULL,
+	items_state           TEXT NOT NULL,
+	items_fetched_at      INTEGER NOT NULL DEFAULT 0,
+	seen_at               INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_contracts_region ON contracts(region_id);
+CREATE INDEX IF NOT EXISTS idx_contracts_items_state ON contracts(items_state, date_issued DESC);
+CREATE TABLE IF NOT EXISTS contract_items(
+	record_id           INTEGER PRIMARY KEY,
+	contract_id         INTEGER NOT NULL,
+	type_id             INTEGER NOT NULL,
+	item_id             INTEGER,
+	quantity            INTEGER NOT NULL,
+	is_included         INTEGER NOT NULL,
+	is_blueprint_copy   INTEGER NOT NULL,
+	runs                INTEGER,
+	material_efficiency INTEGER,
+	time_efficiency     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_contract_items_contract ON contract_items(contract_id);
 `
 
 // Seed directory bounds, mirroring the Cloudflare seed worker:
@@ -189,6 +227,24 @@ func (s *store) getMeta(key string) (string, error) {
 		return "", fmt.Errorf("warmer: read meta: %w", err)
 	}
 	return v, nil
+}
+
+// bumpMeta increments one integer counter held in meta,
+// treating an unset key as zero. The store's single connection
+// serializes the read-modify-write, so concurrent handlers
+// cannot lose an increment between the read and the write.
+func (s *store) bumpMeta(key string) error {
+	cur, err := s.getMeta(key)
+	if err != nil {
+		return err
+	}
+	var n int64
+	if cur != "" {
+		if parsed, err := strconv.ParseInt(cur, 10, 64); err == nil {
+			n = parsed
+		}
+	}
+	return s.putMeta(key, strconv.FormatInt(n+1, 10))
 }
 
 // putMeta writes one meta value.
@@ -660,6 +716,249 @@ func (s *store) deleteDemand(kind, key string) error {
 func (s *store) pruneDemand(now time.Time) error {
 	if _, err := s.db.Exec(`DELETE FROM swarm_demand WHERE last_asked <= ?`, now.Add(-demandTTL).UTC().Unix()); err != nil {
 		return fmt.Errorf("warmer: prune demand: %w", err)
+	}
+	return nil
+}
+
+// Contract items states: a header is swept first and its item
+// list fetched once, ever, afterwards. 'pending' awaits that
+// fetch; 'stored' holds the list; 'private' is ESI's 400 for
+// courier cargo (private by design, not a failure); 'gone' is
+// its 404 (the contract ended between the listing sweep and
+// the items fetch). Only 'stored' ever serves.
+const (
+	contractItemsPending = "pending"
+	contractItemsStored  = "stored"
+	contractItemsPrivate = "private"
+	contractItemsGone    = "gone"
+)
+
+// contractRow is one stored contract header plus, when read
+// through getContract, its item list. Date fields are unix
+// seconds, matching the wire payload exactly.
+type contractRow struct {
+	contractID          int64
+	regionID            int64
+	contractType        string
+	issuerID            int64
+	issuerCorporationID int64
+	forCorporation      bool
+	title               string
+	price               float64
+	buyout              float64
+	reward              float64
+	collateral          float64
+	volume              float64
+	startLocationID     int64
+	endLocationID       int64
+	dateIssued          int64
+	dateExpired         int64
+	daysToComplete      int64
+	itemsState          string
+	itemsFetchedAt      time.Time
+	seenAt              time.Time
+	items               []swarmContractItem
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// nullableInt flattens an optional ID/statistic for storage:
+// nil stays SQL NULL, never a fabricated zero.
+func nullableInt(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+// ptrFromNull rebuilds an optional value from a stored
+// column: SQL NULL comes back as a nil pointer.
+func ptrFromNull(v sql.NullInt64) *int64 {
+	if !v.Valid {
+		return nil
+	}
+	out := v.Int64
+	return &out
+}
+
+func scanContractHeader(scan func(dest ...any) error) (contractRow, error) {
+	var c contractRow
+	var forCorp int
+	var itemsFetchedUnix, seenUnix int64
+	if err := scan(&c.contractID, &c.regionID, &c.contractType, &c.issuerID, &c.issuerCorporationID, &forCorp,
+		&c.title, &c.price, &c.buyout, &c.reward, &c.collateral, &c.volume,
+		&c.startLocationID, &c.endLocationID, &c.dateIssued, &c.dateExpired, &c.daysToComplete,
+		&c.itemsState, &itemsFetchedUnix, &seenUnix); err != nil {
+		return contractRow{}, err
+	}
+	c.forCorporation = forCorp != 0
+	if itemsFetchedUnix != 0 {
+		c.itemsFetchedAt = time.Unix(itemsFetchedUnix, 0).UTC()
+	}
+	if seenUnix != 0 {
+		c.seenAt = time.Unix(seenUnix, 0).UTC()
+	}
+	return c, nil
+}
+
+const contractHeaderColumns = `contract_id, region_id, type, issuer_id, issuer_corporation_id, for_corporation, title, price, buyout, reward, collateral, volume, start_location_id, end_location_id, date_issued, date_expired, days_to_complete, items_state, items_fetched_at, seen_at`
+
+// upsertContractHeader stores one swept contract header,
+// refreshing its facts and seen_at on conflict. It NEVER
+// touches items_state or items_fetched_at on conflict: a
+// contract's item list is fetched once, ever, and a listing
+// refresh that reset the state would refetch (or worse,
+// un-store) a list already held. A brand-new header starts
+// 'pending' — the items drain picks it up from there.
+func (s *store) upsertContractHeader(c contractRow, seenAt time.Time) error {
+	if _, err := s.db.Exec(`INSERT INTO contracts(`+contractHeaderColumns+`)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?)
+		ON CONFLICT(contract_id) DO UPDATE SET
+			region_id = excluded.region_id, type = excluded.type,
+			issuer_id = excluded.issuer_id, issuer_corporation_id = excluded.issuer_corporation_id,
+			for_corporation = excluded.for_corporation, title = excluded.title,
+			price = excluded.price, buyout = excluded.buyout, reward = excluded.reward,
+			collateral = excluded.collateral, volume = excluded.volume,
+			start_location_id = excluded.start_location_id, end_location_id = excluded.end_location_id,
+			date_issued = excluded.date_issued, date_expired = excluded.date_expired,
+			days_to_complete = excluded.days_to_complete, seen_at = excluded.seen_at`,
+		c.contractID, c.regionID, c.contractType, c.issuerID, c.issuerCorporationID, boolToInt(c.forCorporation),
+		c.title, c.price, c.buyout, c.reward, c.collateral, c.volume,
+		c.startLocationID, c.endLocationID, c.dateIssued, c.dateExpired, c.daysToComplete,
+		seenAt.UTC().Unix()); err != nil {
+		return fmt.Errorf("warmer: store contract header: %w", err)
+	}
+	return nil
+}
+
+// listContractsPendingItems lists headers still awaiting their
+// one items fetch, newest first — a fresh contract is the one
+// a pull is most likely to be waiting on.
+func (s *store) listContractsPendingItems(limit int) ([]contractRow, error) {
+	rows, err := s.db.Query(`SELECT `+contractHeaderColumns+` FROM contracts
+		WHERE items_state = 'pending' ORDER BY date_issued DESC, contract_id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("warmer: list pending contracts: %w", err)
+	}
+	defer rows.Close()
+	var out []contractRow
+	for rows.Next() {
+		c, err := scanContractHeader(rows.Scan)
+		if err != nil {
+			return nil, fmt.Errorf("warmer: list pending contracts: %w", err)
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("warmer: list pending contracts: %w", err)
+	}
+	return out, nil
+}
+
+// putContractItems stores one contract's item list in a
+// single transaction and settles the header as 'stored' with
+// its fetch time. Rows insert-or-ignore per record_id, like
+// the main instance: a record already held is the same record,
+// never a duplicate and never a reason to fail the list.
+func (s *store) putContractItems(contractID int64, items []swarmContractItem, fetchedAt time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("warmer: contract items transaction: %w", err)
+	}
+	defer tx.Rollback()
+	for _, it := range items {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO contract_items(record_id, contract_id, type_id, item_id, quantity, is_included, is_blueprint_copy, runs, material_efficiency, time_efficiency)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			it.RecordID, contractID, it.TypeID, nullableInt(it.ItemID), it.Quantity, boolToInt(it.IsIncluded), boolToInt(it.IsBlueprintCopy),
+			nullableInt(it.Runs), nullableInt(it.MaterialEfficiency), nullableInt(it.TimeEfficiency)); err != nil {
+			return fmt.Errorf("warmer: store contract item: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE contracts SET items_state = 'stored', items_fetched_at = ? WHERE contract_id = ?`,
+		fetchedAt.UTC().Unix(), contractID); err != nil {
+		return fmt.Errorf("warmer: settle contract items: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("warmer: commit contract items: %w", err)
+	}
+	return nil
+}
+
+// setContractItemsState moves one header to a terminal items
+// state ('private' or 'gone') without touching its fetch time:
+// no list was ever fetched for it.
+func (s *store) setContractItemsState(contractID int64, state string) error {
+	if _, err := s.db.Exec(`UPDATE contracts SET items_state = ? WHERE contract_id = ?`, state, contractID); err != nil {
+		return fmt.Errorf("warmer: set contract items state: %w", err)
+	}
+	return nil
+}
+
+// getContract reads one contract header plus its item list
+// (ok false when the contract is unknown). NULL item columns
+// come back as nil pointers, exactly as the wire payload
+// carries them. The item list is an empty slice, never nil,
+// for a held contract, so a stored contract with no lines
+// still marshals "items":[].
+func (s *store) getContract(contractID int64) (contractRow, bool, error) {
+	c, err := scanContractHeader(s.db.QueryRow(`SELECT `+contractHeaderColumns+` FROM contracts WHERE contract_id = ?`, contractID).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return contractRow{}, false, nil
+	}
+	if err != nil {
+		return contractRow{}, false, fmt.Errorf("warmer: read contract: %w", err)
+	}
+	c.items = []swarmContractItem{}
+	rows, err := s.db.Query(`SELECT record_id, type_id, item_id, quantity, is_included, is_blueprint_copy, runs, material_efficiency, time_efficiency
+		FROM contract_items WHERE contract_id = ? ORDER BY record_id`, contractID)
+	if err != nil {
+		return contractRow{}, false, fmt.Errorf("warmer: read contract items: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var it swarmContractItem
+		var included, bpc int
+		var itemID, runs, me, te sql.NullInt64
+		if err := rows.Scan(&it.RecordID, &it.TypeID, &itemID, &it.Quantity, &included, &bpc, &runs, &me, &te); err != nil {
+			return contractRow{}, false, fmt.Errorf("warmer: read contract items: %w", err)
+		}
+		it.ItemID = ptrFromNull(itemID)
+		it.Runs = ptrFromNull(runs)
+		it.MaterialEfficiency = ptrFromNull(me)
+		it.TimeEfficiency = ptrFromNull(te)
+		it.IsIncluded = included != 0
+		it.IsBlueprintCopy = bpc != 0
+		c.items = append(c.items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return contractRow{}, false, fmt.Errorf("warmer: read contract items: %w", err)
+	}
+	return c, true, nil
+}
+
+// pruneExpiredContracts drops contracts whose expiry has
+// passed, together with their items: an expired contract can
+// never serve again, and keeping its lines would only grow
+// the store with dead appraisals.
+func (s *store) pruneExpiredContracts(now time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("warmer: prune contracts transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM contract_items WHERE contract_id IN (SELECT contract_id FROM contracts WHERE date_expired <= ?)`, now.UTC().Unix()); err != nil {
+		return fmt.Errorf("warmer: prune contract items: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM contracts WHERE date_expired <= ?`, now.UTC().Unix()); err != nil {
+		return fmt.Errorf("warmer: prune contracts: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("warmer: commit prune contracts: %w", err)
 	}
 	return nil
 }

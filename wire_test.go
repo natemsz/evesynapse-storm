@@ -283,3 +283,23 @@ func TestAnnounceEntryShape(t *testing.T) {
 		}
 	}
 }
+
+// TestSwarmPullMessageExact pins the signed-pull message bytes:
+// the prefix, the decimal timestamp, and the lowercase hex
+// SHA-256 of the exact body. The main instance builds the same
+// bytes; any drift makes every signed pull fail verification
+// on both sides, so the vector is hand-computed here.
+// SHA-256("{}") is the well-known
+// 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a.
+func TestSwarmPullMessageExact(t *testing.T) {
+	got := swarmPullMessage("instance-1", 1760000000, []byte("{}"))
+	want := "pull\ninstance-1\n1760000000\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+	if string(got) != want {
+		t.Errorf("pull message:\n got %q\nwant %q", got, want)
+	}
+	// A different body hashes differently: the signature is
+	// bound to the exact request, not just the instance.
+	if string(swarmPullMessage("instance-1", 1760000000, []byte("{ }"))) == want {
+		t.Error("pull message ignores the body bytes")
+	}
+}

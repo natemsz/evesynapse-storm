@@ -16,6 +16,10 @@ package main
 //     enumerates the ones the swarm wants, so the first pull for
 //     an unheld record fetches it (single-flighted), then it is
 //     served from SQLite until its Expires lapses;
+//   - public contracts per hub region: listing headers swept
+//     when their Expires lapses, then each contract's item list
+//     fetched once (bounded per tick), because the listing
+//     alone appraises nothing;
 //   - swarm demand first of all: covered keys peers pulled and
 //     this node missed (warm.go), so the next pull serves them.
 //
@@ -64,6 +68,12 @@ const (
 	maxHistoryPerTick = 100
 	maxNamesPerTick   = 5000
 	namesBatchSize    = 1000
+	// maxContractItemsPerTick bounds the contract-items drain
+	// per tick: each pending contract costs one ESI call, and
+	// a fresh region sweep can queue thousands of headers at
+	// once — the drain ramps like the history backlog does,
+	// newest contracts first.
+	maxContractItemsPerTick = 50
 )
 
 // orgNegativeTTL is how long a missing (404) corporation or
@@ -109,6 +119,47 @@ type esiName struct {
 	Category string `json:"category"`
 }
 
+// esiPublicContract is one row of
+// GET /contracts/public/{region}/, mirrored field-for-field
+// from the main instance's ESI shape. Dates arrive as RFC3339
+// strings and are parsed to unix seconds at sweep time; the
+// region is not in the row — it is the endpoint's argument.
+type esiPublicContract struct {
+	ContractID          int64   `json:"contract_id"`
+	IssuerID            int64   `json:"issuer_id"`
+	IssuerCorporationID int64   `json:"issuer_corporation_id"`
+	Type                string  `json:"type"`
+	Title               string  `json:"title"`
+	ForCorporation      bool    `json:"for_corporation"`
+	Price               float64 `json:"price"`
+	Reward              float64 `json:"reward"`
+	Buyout              float64 `json:"buyout"`
+	Collateral          float64 `json:"collateral"`
+	Volume              float64 `json:"volume"`
+	StartLocationID     int64   `json:"start_location_id"`
+	EndLocationID       int64   `json:"end_location_id"`
+	DateIssued          string  `json:"date_issued"`
+	DateExpired         string  `json:"date_expired"`
+	DaysToComplete      int64   `json:"days_to_complete"`
+}
+
+// esiPublicContractItem is one row of
+// GET /contracts/public/items/{contract}/. ItemID is a
+// pointer because the field is absent for a stack with no
+// singleton item (a decoded 0 means the same); the blueprint
+// fields exist only on copies.
+type esiPublicContractItem struct {
+	RecordID           int64  `json:"record_id"`
+	TypeID             int64  `json:"type_id"`
+	ItemID             *int64 `json:"item_id"`
+	Quantity           int64  `json:"quantity"`
+	IsIncluded         bool   `json:"is_included"`
+	IsBlueprintCopy    bool   `json:"is_blueprint_copy"`
+	Runs               *int64 `json:"runs"`
+	MaterialEfficiency *int64 `json:"material_efficiency"`
+	TimeEfficiency     *int64 `json:"time_efficiency"`
+}
+
 // poller fetches ESI into the store and serves swarm keys.
 type poller struct {
 	cfg   config
@@ -144,6 +195,10 @@ func (p *poller) tick(ctx context.Context, now time.Time) time.Duration {
 	if hold := p.esi.budgetHold(now); hold > 0 {
 		return hold
 	}
+	// Expired contracts prune once per tick, up front, so the
+	// prune runs even when a later pass ends the tick early on
+	// ESI's stop signal.
+	_ = p.store.pruneExpiredContracts(now)
 	p.heartbeatDue(ctx, now)
 	if hold, done := p.pollDemand(ctx, now); done {
 		return hold
@@ -154,6 +209,12 @@ func (p *poller) tick(ctx context.Context, now time.Time) time.Duration {
 		}
 	}
 	if hold, done := p.pollHistory(ctx, now); done {
+		return hold
+	}
+	if hold, done := p.pollContracts(ctx, now); done {
+		return hold
+	}
+	if hold, done := p.pollContractItems(ctx, now); done {
 		return hold
 	}
 	if hold, done := p.pollNames(ctx); done {
@@ -306,6 +367,153 @@ func (p *poller) fetchHistory(ctx context.Context, regionID, typeID int64, now t
 	return 0, false
 }
 
+// pollContracts sweeps public contract listings for every hub
+// region whose Expires ledger has lapsed, storing headers only:
+// the item lists drain separately (pollContractItems), bounded
+// per tick, so a region's first sweep does not turn into tens
+// of thousands of items calls in one pass. True when the pass
+// ended early on ESI's stop signal.
+func (p *poller) pollContracts(ctx context.Context, now time.Time) (time.Duration, bool) {
+	for _, region := range hubRegions {
+		key := fmt.Sprintf("contracts/%d", region.id)
+		fresh, err := p.store.cacheFresh(key, now)
+		if err != nil {
+			continue
+		}
+		if fresh {
+			continue
+		}
+		bodies, expires, err := p.esi.getPages(ctx, fmt.Sprintf("/contracts/public/%d/", region.id))
+		if err != nil {
+			if hold, stop := limited(err); stop {
+				return hold, true
+			}
+			continue
+		}
+		for _, body := range bodies {
+			var contracts []esiPublicContract
+			if err := json.Unmarshal(body, &contracts); err != nil {
+				continue
+			}
+			for _, c := range contracts {
+				if c.ContractID <= 0 {
+					continue
+				}
+				issued, err := time.Parse(time.RFC3339, c.DateIssued)
+				if err != nil {
+					continue
+				}
+				expired, err := time.Parse(time.RFC3339, c.DateExpired)
+				if err != nil {
+					continue
+				}
+				header := contractRow{
+					contractID: c.ContractID, regionID: region.id, contractType: c.Type,
+					issuerID: c.IssuerID, issuerCorporationID: c.IssuerCorporationID, forCorporation: c.ForCorporation,
+					title: c.Title, price: c.Price, buyout: c.Buyout, reward: c.Reward, collateral: c.Collateral,
+					volume: c.Volume, startLocationID: c.StartLocationID, endLocationID: c.EndLocationID,
+					dateIssued: issued.UTC().Unix(), dateExpired: expired.UTC().Unix(), daysToComplete: c.DaysToComplete,
+				}
+				if err := p.store.upsertContractHeader(header, now); err != nil {
+					return 0, false
+				}
+			}
+		}
+		// The sweep is due again when its Expires lapses; the
+		// ledger records it so a restart resumes warm, exactly
+		// as the order-book sweep does.
+		if err := p.store.noteCache(key, expires); err != nil {
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// pollContractItems drains pending contract item lists, bounded
+// per tick, newest contracts first. True when the pass ended
+// early on ESI's stop signal.
+func (p *poller) pollContractItems(ctx context.Context, now time.Time) (time.Duration, bool) {
+	pending, err := p.store.listContractsPendingItems(maxContractItemsPerTick)
+	if err != nil {
+		return 0, false
+	}
+	for _, c := range pending {
+		if hold, stop := p.fetchContractItems(ctx, c.contractID, now); stop {
+			return hold, true
+		}
+	}
+	return 0, false
+}
+
+// fetchContractItems performs one contract's single items
+// fetch — the fetcher the per-tick drain and swarm demand
+// share, so a demanded contract and a routinely drained one
+// settle identically. Success stores the list; a 400 settles
+// 'private' (courier cargo is private by design, not a
+// failure to retry); a 404 settles 'gone' (the contract ended
+// between the listing sweep and this fetch); any other error
+// leaves the header 'pending' for the next pass. There is no
+// attempt counter in v1: a contract whose items endpoint
+// keeps failing transiently is retried once per drain pass,
+// bounded by maxContractItemsPerTick, and expires out of the
+// queue when the contract itself expires. Stop-signal errors
+// end the pass like everywhere else.
+func (p *poller) fetchContractItems(ctx context.Context, contractID int64, now time.Time) (time.Duration, bool) {
+	body, _, err := p.esi.get(ctx, fmt.Sprintf("/contracts/public/items/%d/", contractID))
+	if err != nil {
+		if hold, stop := limited(err); stop {
+			return hold, true
+		}
+		if isStatus(err, http.StatusBadRequest) {
+			_ = p.store.setContractItemsState(contractID, contractItemsPrivate)
+			return 0, false
+		}
+		if isNotFound(err) {
+			_ = p.store.setContractItemsState(contractID, contractItemsGone)
+			return 0, false
+		}
+		return 0, false
+	}
+	var rows []esiPublicContractItem
+	if err := json.Unmarshal(body, &rows); err != nil {
+		return 0, false
+	}
+	items := make([]swarmContractItem, 0, len(rows))
+	for _, row := range rows {
+		if row.RecordID <= 0 || row.TypeID <= 0 {
+			continue
+		}
+		item := swarmContractItem{
+			RecordID: row.RecordID, TypeID: row.TypeID, Quantity: row.Quantity,
+			IsIncluded: row.IsIncluded, IsBlueprintCopy: row.IsBlueprintCopy,
+			Runs: row.Runs, MaterialEfficiency: row.MaterialEfficiency, TimeEfficiency: row.TimeEfficiency,
+		}
+		// ESI omits item_id for a stack with no singleton
+		// item; a decoded pointer to 0 means the same, and
+		// the wire carries both as nil.
+		if row.ItemID != nil && *row.ItemID != 0 {
+			v := *row.ItemID
+			item.ItemID = &v
+		}
+		items = append(items, item)
+	}
+	if len(items) > maxSwarmContractItems {
+		items = items[:maxSwarmContractItems]
+	}
+	if err := p.store.putContractItems(contractID, items, now); err != nil {
+		return 0, false
+	}
+	return 0, false
+}
+
+// isStatus reports whether err is an ESI statusError with the
+// given status — the 400 sibling of isNotFound, for endpoints
+// where a 400 is an answer (courier cargo), not a failure.
+func isStatus(err error, status int) bool {
+	var se *statusError
+	return errors.As(err, &se) && se.status == status
+}
+
 // pollNames resolves unseen type names, batched a thousand to
 // the call. True when the pass ended early.
 func (p *poller) pollNames(ctx context.Context) (time.Duration, bool) {
@@ -413,7 +621,8 @@ func announcePayload(id *swarmIdentity, baseURL string, issuedAt int64) string {
 // serveKey reads one shared key for a peer pull. It serves only
 // rows the poll loop holds fresh — history inside the refetch
 // gate, any held type name, records inside their Expires (or
-// fetched live on first demand). Anything else is a miss.
+// fetched live on first demand), contracts stored whole and
+// unexpired. Anything else is a miss.
 func (p *poller) serveKey(ctx context.Context, kind, key string, now time.Time) (payload string, fetchedAt time.Time, ok bool) {
 	switch kind {
 	case swarmKindHistory:
@@ -424,9 +633,52 @@ func (p *poller) serveKey(ctx context.Context, kind, key string, now time.Time) 
 		return p.serveOrg(ctx, "corporation", key, now)
 	case swarmKindAlliance:
 		return p.serveOrg(ctx, "alliance", key, now)
+	case swarmKindPublicContract:
+		return p.serveContract(key, now)
 	default:
 		return "", time.Time{}, false
 	}
+}
+
+// serveContract serves one public contract whole — header
+// plus its item list — and only whole: a contract whose items
+// were never stored (still pending, courier-private, or gone)
+// appraises nothing, so it is a miss, and an expired contract
+// is a miss even before the prune drops it. The entry's
+// fetchedAt is the items fetch time: that is when the payload
+// became complete, not when the listing header was swept.
+func (p *poller) serveContract(key string, now time.Time) (string, time.Time, bool) {
+	contractID, ok := parseSwarmID(key)
+	if !ok {
+		return "", time.Time{}, false
+	}
+	c, held, err := p.store.getContract(contractID)
+	if err != nil || !held {
+		return "", time.Time{}, false
+	}
+	if c.itemsState != contractItemsStored || c.dateExpired <= now.Unix() {
+		return "", time.Time{}, false
+	}
+	if len(c.items) > maxSwarmContractItems {
+		return "", time.Time{}, false
+	}
+	items := c.items
+	if items == nil {
+		items = []swarmContractItem{}
+	}
+	out := swarmContractPayload{
+		ContractID: c.contractID, RegionID: c.regionID, Type: c.contractType,
+		IssuerID: c.issuerID, IssuerCorporationID: c.issuerCorporationID, ForCorporation: c.forCorporation,
+		Title: c.title, Price: c.price, Buyout: c.buyout, Reward: c.reward, Collateral: c.collateral,
+		Volume: c.volume, StartLocationID: c.startLocationID, EndLocationID: c.endLocationID,
+		DateIssued: c.dateIssued, DateExpired: c.dateExpired, DaysToComplete: c.daysToComplete,
+		Items: items,
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	return string(raw), c.itemsFetchedAt, true
 }
 
 // serveHistory serves one region/type pair's day rows, newest

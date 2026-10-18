@@ -130,6 +130,13 @@ func (f *fakeESI) handle(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/alliances/"):
 		w.Header().Set("Expires", future)
 		_, _ = w.Write([]byte(`{"name":"Fake Alliance","ticker":"FAL"}`))
+	case strings.HasPrefix(r.URL.Path, "/contracts/public/"):
+		// An empty listing: the shared fake warms no contracts,
+		// so routine ticks exercise the sweep's cache ledger
+		// without queueing item fetches. Contract-specific
+		// fakes live in contracts_test.go.
+		w.Header().Set("Expires", future)
+		_ = json.NewEncoder(w).Encode([]esiPublicContract{})
 	default:
 		http.NotFound(w, r)
 	}

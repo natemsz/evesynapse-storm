@@ -30,7 +30,7 @@ import (
 
 // warmKinds is this node's coverage, in the order /swarm/warms
 // lists it.
-var warmKinds = []string{swarmKindHistory, swarmKindTypeName, swarmKindCorporation, swarmKindAlliance}
+var warmKinds = []string{swarmKindHistory, swarmKindTypeName, swarmKindCorporation, swarmKindAlliance, swarmKindPublicContract}
 
 // Drain bounds: at most this many demanded keys per pass (the
 // history backlog's own bound), and a failed key waits this long
@@ -58,7 +58,7 @@ func demandable(kind, key string) bool {
 	case swarmKindHistory:
 		_, _, ok := parseHistoryKey(key)
 		return ok
-	case swarmKindTypeName, swarmKindCorporation, swarmKindAlliance:
+	case swarmKindTypeName, swarmKindCorporation, swarmKindAlliance, swarmKindPublicContract:
 		_, ok := parseSwarmID(key)
 		return ok
 	default:
@@ -151,6 +151,56 @@ func (p *poller) fetchDemand(ctx context.Context, kind, key string, now time.Tim
 			return false, time.Time{}, hold, true
 		}
 		return ok, time.Time{}, 0, false
+	case swarmKindPublicContract:
+		contractID, ok := parseSwarmID(key)
+		if !ok {
+			return false, time.Time{}, 0, false
+		}
+		c, held, err := p.store.getContract(contractID)
+		if err != nil {
+			return false, time.Time{}, 0, false
+		}
+		if !held {
+			// The header itself is discovered by the
+			// regional listing sweep, not by demand:
+			// there is no endpoint that names one
+			// contract's region, so demanding an
+			// undiscovered ID cannot fetch it. The
+			// demand simply waits out its backoff, the
+			// sweep may discover the header meanwhile,
+			// and pruneDemand ages the key out after a
+			// day of nobody serving it.
+			return false, now.Add(demandRetryBackoff), 0, false
+		}
+		if c.itemsState == contractItemsStored && c.dateExpired > now.Unix() {
+			return true, time.Time{}, 0, false
+		}
+		if c.itemsState == contractItemsPrivate || c.itemsState == contractItemsGone {
+			// Terminal: the item list was fetched once
+			// and ESI answered that there is none to
+			// store. Nothing a retry could change.
+			return true, time.Time{}, 0, false
+		}
+		if c.itemsState != contractItemsPending {
+			return false, now.Add(demandRetryBackoff), 0, false
+		}
+		// A held header awaiting its items: fetch them
+		// now, through the same fetcher the drain uses,
+		// so the next pull serves the contract whole.
+		if hold, stop := p.fetchContractItems(ctx, contractID, now); stop {
+			return false, time.Time{}, hold, true
+		}
+		after, held, err := p.store.getContract(contractID)
+		if err != nil || !held {
+			return false, time.Time{}, 0, false
+		}
+		if after.itemsState == contractItemsStored && after.dateExpired > now.Unix() {
+			return true, time.Time{}, 0, false
+		}
+		if after.itemsState == contractItemsPrivate || after.itemsState == contractItemsGone {
+			return true, time.Time{}, 0, false
+		}
+		return false, time.Time{}, 0, false
 	default:
 		return false, time.Time{}, 0, false
 	}
