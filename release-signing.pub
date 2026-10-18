@@ -1,0 +1,10 @@
+The public half of the key storm releases are signed with — the
+same release key as EveSynapse (its public half also lives in that
+repo's internal/releasesig/trusted_keys.pem). The private half is
+the RELEASE_SIGNING_KEY Actions secret; the release workflow
+refuses to sign with a key whose public half is not listed here.
+Only public keys belong in this file.
+
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEARnB9SqpA6cDuYQkHBA4zFu0KvWhDP85WmcN5kKxPiWI=
+-----END PUBLIC KEY-----

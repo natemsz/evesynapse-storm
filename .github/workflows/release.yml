@@ -5,8 +5,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write
-  attestations: write
 
 jobs:
   release:
@@ -25,11 +23,18 @@ jobs:
       - run: tar -czf storm-linux-amd64.tar.gz storm-amd64 setup.sh
       - run: tar -czf storm-linux-arm64.tar.gz storm-arm64 setup.sh
       - run: sha256sum storm-amd64 storm-arm64 storm-linux-amd64.tar.gz storm-linux-arm64.tar.gz > SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: |
-            storm-amd64
-            storm-arm64
+      # Only a signed release is published: the checksums are signed
+      # with the release key (RELEASE_SIGNING_KEY secret, the same key
+      # as EveSynapse's), and stormsign refuses to sign with a key
+      # whose public half is not committed in release-signing.pub.
+      # If the secret is missing or wrong this step fails and no
+      # release is created.
+      - name: Sign the checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          go run ./cmd/stormsign sign SHA256SUMS
+          go run ./cmd/stormsign verify SHA256SUMS
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -37,6 +42,6 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             storm-amd64 storm-arm64 \
             storm-linux-amd64.tar.gz storm-linux-arm64.tar.gz \
-            SHA256SUMS \
+            SHA256SUMS SHA256SUMS.sig \
             --title "Storm ${GITHUB_REF_NAME}" \
-            --notes "Storm warmer ${GITHUB_REF_NAME}. Bare binaries (storm-amd64, storm-arm64) with build-provenance attestations (verify: gh attestation verify <file> --repo natemsz/evesynapse-storm), per-arch tarballs with setup.sh, and SHA256SUMS. The bare binaries' SHA-256 digests are the values for the EveSynapse release library (type: Storm)."
+            --notes "Storm warmer ${GITHUB_REF_NAME}. Bare binaries (storm-amd64, storm-arm64) per-arch tarballs with setup.sh, and SHA256SUMS signed by the release key (SHA256SUMS.sig; public half in release-signing.pub in the repo). The bare binaries' SHA-256 digests are the values for the EveSynapse release library (type: Storm)."
