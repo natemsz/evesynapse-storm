@@ -1,0 +1,42 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+      - run: GOOS=linux GOARCH=amd64 go build -trimpath -o storm-amd64 .
+        env:
+          CGO_ENABLED: '0'
+      - run: GOOS=linux GOARCH=arm64 go build -trimpath -o storm-arm64 .
+        env:
+          CGO_ENABLED: '0'
+      - run: tar -czf storm-linux-amd64.tar.gz storm-amd64 setup.sh
+      - run: tar -czf storm-linux-arm64.tar.gz storm-arm64 setup.sh
+      - run: sha256sum storm-amd64 storm-arm64 storm-linux-amd64.tar.gz storm-linux-arm64.tar.gz > SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            storm-amd64
+            storm-arm64
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            storm-amd64 storm-arm64 \
+            storm-linux-amd64.tar.gz storm-linux-arm64.tar.gz \
+            SHA256SUMS \
+            --title "Storm ${GITHUB_REF_NAME}" \
+            --notes "Storm warmer ${GITHUB_REF_NAME}. Bare binaries (storm-amd64, storm-arm64) with build-provenance attestations (verify: gh attestation verify <file> --repo natemsz/evesynapse-storm), per-arch tarballs with setup.sh, and SHA256SUMS. The bare binaries' SHA-256 digests are the values for the EveSynapse release library (type: Storm)."
