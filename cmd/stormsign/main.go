@@ -61,9 +61,12 @@ func parsePrivate(pemData []byte) ([]ed25519.PrivateKey, error) {
 		if block == nil {
 			break
 		}
+		if block.Type == "PUBLIC KEY" {
+			return nil, fmt.Errorf("RELEASE_SIGNING_KEY holds a PUBLIC key (-----BEGIN PUBLIC KEY-----); the secret must hold the private half, the file whose first line is -----BEGIN PRIVATE KEY-----")
+		}
 		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("RELEASE_SIGNING_KEY is not a parseable PKCS#8 private key (want the complete PEM, -----BEGIN PRIVATE KEY----- through -----END PRIVATE KEY-----, nothing trimmed): %w", err)
 		}
 		priv, ok := parsed.(ed25519.PrivateKey)
 		if !ok {
