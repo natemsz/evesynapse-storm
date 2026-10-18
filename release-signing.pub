@@ -1,0 +1,11 @@
+The public half of the key storm releases are signed with.
+Storm has its own release key (made 2026-10-18 with EveSynapse's
+releasesign keygen): the private half is the RELEASE_SIGNING_KEY
+Actions secret on this repo, with the owner's backup copy in his
+offline storage. The release workflow refuses to sign with a key
+whose public half is not listed here. Only public keys belong in
+this file.
+
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAbYrC7/OVRVsfm0+Qp949clyqldw6rgpAdjauxnYHfHc=
+-----END PUBLIC KEY-----
