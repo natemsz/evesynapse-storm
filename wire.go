@@ -38,13 +38,14 @@ import (
 // The shared data kinds, and the membership kind that signs with
 // the same envelope but never stages as data.
 const (
-	swarmKindMembers     = "swarm_members"
-	swarmKindHistory     = "market_history"
-	swarmKindTypeName    = "type_name"
-	swarmKindCorporation = "corporation_record"
-	swarmKindAlliance    = "alliance_record"
-	swarmKindStructure   = "structure_name"
-	swarmAnnounceKind    = "announce"
+	swarmKindMembers        = "swarm_members"
+	swarmKindHistory        = "market_history"
+	swarmKindTypeName       = "type_name"
+	swarmKindCorporation    = "corporation_record"
+	swarmKindAlliance       = "alliance_record"
+	swarmKindStructure      = "structure_name"
+	swarmKindPublicContract = "public_contract"
+	swarmAnnounceKind       = "announce"
 )
 
 // validSwarmKind reports whether kind is data the swarm carries
@@ -52,7 +53,7 @@ const (
 // gossip, not data).
 func validSwarmKind(kind string) bool {
 	switch kind {
-	case swarmKindHistory, swarmKindTypeName, swarmKindCorporation, swarmKindAlliance, swarmKindStructure:
+	case swarmKindHistory, swarmKindTypeName, swarmKindCorporation, swarmKindAlliance, swarmKindStructure, swarmKindPublicContract:
 		return true
 	default:
 		return false
@@ -75,6 +76,12 @@ const maxSwarmPayloadBytes = 256 * 1024
 // maxSwarmHistoryDays caps one history entry: a year of daily
 // rows plus slack, never an unbounded table dump.
 const maxSwarmHistoryDays = 400
+
+// maxSwarmContractItems caps one contract entry's item list:
+// real contracts hold hundreds of lines at most, and a peer
+// asked to stage thousands per contract could be fed a table
+// dump one contract at a time.
+const maxSwarmContractItems = 1000
 
 // The sealed envelopes. Prefixes, salts and labels are part of
 // the format: changing any of them stops every blob opening.
@@ -205,6 +212,54 @@ type swarmOrgPayload struct {
 type swarmStructurePayload struct {
 	StructureID int64  `json:"structure_id"`
 	Name        string `json:"name"`
+}
+
+// swarmContractPayload is one public contract with its item
+// list, copied field-for-field from the main instance's shape.
+// Dates travel as unix seconds (ESI's RFC3339 strings are
+// parsed once, at sweep time, on this side). The item list is
+// part of the payload because the main instance stages a
+// contract whole: a header without its items appraises
+// nothing. Field order is the JSON order — a golden test pins
+// it, because the main instance strictly decodes this payload
+// and drift must fail here, not in production.
+type swarmContractPayload struct {
+	ContractID          int64               `json:"contract_id"`
+	RegionID            int64               `json:"region_id"`
+	Type                string              `json:"type"`
+	IssuerID            int64               `json:"issuer_id"`
+	IssuerCorporationID int64               `json:"issuer_corporation_id"`
+	ForCorporation      bool                `json:"for_corporation"`
+	Title               string              `json:"title"`
+	Price               float64             `json:"price"`
+	Buyout              float64             `json:"buyout"`
+	Reward              float64             `json:"reward"`
+	Collateral          float64             `json:"collateral"`
+	Volume              float64             `json:"volume"`
+	StartLocationID     int64               `json:"start_location_id"`
+	EndLocationID       int64               `json:"end_location_id"`
+	DateIssued          int64               `json:"date_issued"`
+	DateExpired         int64               `json:"date_expired"`
+	DaysToComplete      int64               `json:"days_to_complete"`
+	Items               []swarmContractItem `json:"items"`
+}
+
+// swarmContractItem is one line of a contract's contents. The
+// pointer fields are genuinely optional in ESI: item_id is
+// absent for a stack with no singleton item, and the
+// blueprint fields exist only on copies — a NULL must travel
+// as JSON null (or an absent value the strict decoder reads
+// as nil), never as a fabricated zero.
+type swarmContractItem struct {
+	RecordID           int64  `json:"record_id"`
+	TypeID             int64  `json:"type_id"`
+	ItemID             *int64 `json:"item_id"`
+	Quantity           int64  `json:"quantity"`
+	IsIncluded         bool   `json:"is_included"`
+	IsBlueprintCopy    bool   `json:"is_blueprint_copy"`
+	Runs               *int64 `json:"runs"`
+	MaterialEfficiency *int64 `json:"material_efficiency"`
+	TimeEfficiency     *int64 `json:"time_efficiency"`
 }
 
 // swarmIdentity is this node: its ID and its signing key.

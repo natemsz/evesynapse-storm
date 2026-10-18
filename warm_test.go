@@ -42,7 +42,7 @@ func pull(t *testing.T, srv *server, keys ...swarmPullKey) []swarmSignedEntry {
 }
 
 // TestWarmsAnnouncesCoverage pins the coverage announcement: dark
-// to a missing or wrong secret, and exactly {"kinds": [the four
+// to a missing or wrong secret, and exactly {"kinds": [the five
 // fetchable kinds]} with it — never structure_name.
 func TestWarmsAnnouncesCoverage(t *testing.T) {
 	srv, _ := testRig(t)
@@ -69,7 +69,7 @@ func TestWarmsAnnouncesCoverage(t *testing.T) {
 	if err := dec.Decode(&body); err != nil {
 		t.Fatalf("warms: unreadable under strict decoding: %v", err)
 	}
-	want := []string{swarmKindHistory, swarmKindTypeName, swarmKindCorporation, swarmKindAlliance}
+	want := []string{swarmKindHistory, swarmKindTypeName, swarmKindCorporation, swarmKindAlliance, swarmKindPublicContract}
 	if !slices.Equal(body.Kinds, want) {
 		t.Errorf("warms: kinds %v, want %v", body.Kinds, want)
 	}
