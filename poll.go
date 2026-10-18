@@ -610,8 +610,11 @@ func (p *poller) heartbeatDue(ctx context.Context, now time.Time) {
 
 // announcePayload seals the heartbeat's member tuple: the
 // address, the key, and the node's signature over the address.
+// Build rides along as the node's self-reported claim (the
+// SHA-256 of its own binary): display metadata for receivers,
+// never a claim about anything but itself.
 func announcePayload(id *swarmIdentity, baseURL string, issuedAt int64) string {
-	raw, err := json.Marshal(seedAnnouncePayload{BaseURL: baseURL, PublicKey: id.publicString(), URLSig: signSwarmMember(id, baseURL, issuedAt), IssuedAt: issuedAt})
+	raw, err := json.Marshal(seedAnnouncePayload{BaseURL: baseURL, PublicKey: id.publicString(), URLSig: signSwarmMember(id, baseURL, issuedAt), IssuedAt: issuedAt, Build: buildClaim()})
 	if err != nil {
 		return ""
 	}

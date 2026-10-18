@@ -94,6 +94,7 @@ func (s *server) handleMembers(w http.ResponseWriter, r *http.Request) {
 		PublicKey: s.id.publicString(),
 		URLSig:    signSwarmMember(s.id, s.cfg.publicBaseURL, now.Unix()),
 		IssuedAt:  now.Unix(),
+		Build:     buildClaim(),
 	}}
 	for _, p := range peers {
 		members = append(members, swarmMember{
