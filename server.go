@@ -146,24 +146,31 @@ const pullAuthWindow = 5 * time.Minute
 // under the directory key over the message built from the
 // exact received body bytes. Any failure is simply false —
 // the caller falls back to the bearer, and a failed signature
-// is never anything more than an auth failure.
-func (s *server) signedPullValid(instanceID, timestampRaw, signature string, body []byte, now time.Time) bool {
+// is never anything more than an auth failure. The reason
+// names the failed check for the caller's log only.
+func (s *server) signedPullValid(instanceID, timestampRaw, signature string, body []byte, now time.Time) (bool, string) {
 	ts, err := strconv.ParseInt(strings.TrimSpace(timestampRaw), 10, 64)
 	if err != nil {
-		return false
+		return false, "timestamp is not a unix time"
 	}
 	diff := now.Unix() - ts
 	if diff < 0 {
 		diff = -diff
 	}
 	if diff > int64(pullAuthWindow/time.Second) {
-		return false
+		return false, "timestamp outside the five-minute window"
 	}
 	key, listed, err := s.poller.store.seedPeerKey(instanceID)
-	if err != nil || !listed {
-		return false
+	if err != nil {
+		return false, "directory lookup failed"
 	}
-	return verifySwarmPull(key, instanceID, ts, body, signature)
+	if !listed {
+		return false, "instance is not listed in the directory"
+	}
+	if !verifySwarmPull(key, instanceID, ts, body, signature) {
+		return false, "signature does not verify under the directory key"
+	}
+	return true, ""
 }
 
 // handlePull serves the signed entries for the requested keys
@@ -201,14 +208,14 @@ func (s *server) handlePull(w http.ResponseWriter, r *http.Request) {
 	timestampRaw := r.Header.Get("X-Swarm-Timestamp")
 	signature := r.Header.Get("X-Swarm-Signature")
 	if instanceID != "" && timestampRaw != "" && signature != "" {
-		if s.signedPullValid(instanceID, timestampRaw, signature, raw, now) {
+		if ok, reason := s.signedPullValid(instanceID, timestampRaw, signature, raw, now); ok {
 			authKind = "signed"
 		} else {
 			// Logged once for visibility — a peer whose
 			// clock or key drifted is otherwise invisible,
 			// silently riding the bearer — and nothing
 			// more: the bearer decides below.
-			log.Printf("warmer: pull: signed auth failed for instance %q, falling back to bearer", instanceID)
+			log.Printf("warmer: pull: signed auth failed for instance %q (%s), falling back to bearer", instanceID, reason)
 		}
 	}
 	if authKind == "" {

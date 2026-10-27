@@ -465,3 +465,66 @@ func TestPullLegacyBearerAloneStillServes(t *testing.T) {
 		t.Errorf("pull_auth_signed = %q, want unset", got)
 	}
 }
+
+// TestSignedPullAfterSeedRegister proves the signed path end to
+// end through the route a real puller files by: a heartbeat at
+// /swarm/seed/register lists the puller in the directory, and
+// its signed pull then serves as signed, never legacy. A body
+// tampered after signing falls back to the bearer.
+func TestSignedPullAfterSeedRegister(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := postEntry(srv, announceHeartbeat(t, puller, "https://puller.example.com")); rec.Code != http.StatusOK {
+		t.Fatalf("register: status %d, want 200", rec.Code)
+	}
+	rec := httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, signedPullRequest(t, puller, pullBody(t), time.Now().UTC()))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signed pull: status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "1" {
+		t.Errorf("pull_auth_signed = %q, want 1", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "" {
+		t.Errorf("pull_auth_legacy = %q, want unset", got)
+	}
+
+	// Tampered body: the signature no longer covers the bytes.
+	body := pullBody(t)
+	r := signedPullRequest(t, puller, body, time.Now().UTC())
+	tampered := bytes.Replace(body, []byte("34"), []byte("35"), 1)
+	r2 := httptest.NewRequest(http.MethodPost, "/swarm/pull", bytes.NewReader(tampered))
+	r2.Header = r.Header
+	r2.Header.Set("Authorization", "Bearer "+testSecret)
+	rec = httptest.NewRecorder()
+	srv.handler().ServeHTTP(rec, r2)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tampered pull with bearer: status %d", rec.Code)
+	}
+	if got := pullCounter(t, srv, "pull_auth_signed"); got != "1" {
+		t.Errorf("pull_auth_signed after tamper = %q, want 1", got)
+	}
+	if got := pullCounter(t, srv, "pull_auth_legacy"); got != "1" {
+		t.Errorf("pull_auth_legacy after tamper = %q, want 1", got)
+	}
+}
+
+// TestSignedPullUnlistedReason proves the directory check is
+// the one that refuses a self-consistent signature from an
+// instance that never filed a heartbeat.
+func TestSignedPullUnlistedReason(t *testing.T) {
+	srv, _ := testRig(t)
+	puller, err := mintSwarmIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := pullBody(t)
+	now := time.Now().UTC()
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(puller.private, swarmPullMessage(puller.id, now.Unix(), body)))
+	if ok, reason := srv.signedPullValid(puller.id, strconv.FormatInt(now.Unix(), 10), sig, body, now); ok || reason != "instance is not listed in the directory" {
+		t.Errorf("unlisted puller: ok=%v reason=%q, want the directory refusal", ok, reason)
+	}
+}
